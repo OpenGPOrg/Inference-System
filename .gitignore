@@ -1,0 +1,23 @@
+# Build Artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Models (Keep models folder empty in git, friends download their own)
+models/*
+!models/.gitkeep
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Logs & temp
+*.log
+/tmp/
