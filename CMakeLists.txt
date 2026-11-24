@@ -43,6 +43,7 @@ add_library(opengp_reasoner_core STATIC
     src/reasoner/model_config.cpp
     src/reasoner/weight_store.cpp
     src/reasoner/kv_cache.cpp
+    src/reasoner/recurrent_cache.cpp
     src/reasoner/layer_graph.cpp
     src/reasoner/reasoner_engine.cpp
 )

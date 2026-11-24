@@ -143,7 +143,16 @@ bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
         return false;
     }
 
-    if (!kv_cache_.init(config_, layer_range_.count(), backend_, options_.kv_precision)) {
+    const std::vector<LayerKind> layer_kinds = WeightStore::detect_layer_kinds(gctx_, config_, layer_range_);
+
+    // 1. Fixed O(1) recurrent states for SSM layers (no-op if pure Attention)
+    if (!recurrent_cache_.init(config_, layer_kinds, backend_)) {
+        cleanup();
+        return false;
+    }
+
+    // 2. Sparse KV cache for Attention layers only
+    if (!kv_cache_.init(config_, layer_kinds, backend_, options_.kv_precision)) {
         cleanup();
         return false;
     }
@@ -219,6 +228,7 @@ bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
 
 void ReasoningEngine::reset_kv_cache() {
     kv_cache_.reset();
+    recurrent_cache_.reset();
 }
 
 bool ReasoningEngine::forward_layer(int             local_layer_idx,
@@ -234,12 +244,12 @@ bool ReasoningEngine::forward_layer(int             local_layer_idx,
     }
 
     const LayerWeights & lw = weights_.prepare_layer(local_layer_idx);
-    const size_t layer_ctx_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead();
+    const size_t layer_ctx_bytes = ggml_tensor_overhead() * 256 + ggml_graph_overhead();
     struct ggml_context * gctx = ggml_init({ layer_ctx_bytes, nullptr, true });
     if (!gctx) return false;
 
     LayerGraphIO io = build_layer_graph(
-        gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, local_layer_idx,
+        gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, &recurrent_cache_, local_layer_idx,
         static_cast<int>(n_tokens), static_cast<int>(n_past));
 
     if (!ggml_gallocr_alloc_graph(gallocr_, io.graph)) {
@@ -253,9 +263,13 @@ bool ReasoningEngine::forward_layer(int             local_layer_idx,
     const size_t d_model = static_cast<size_t>(config_.d_model);
     const size_t n_total = n_past + n_tokens;
 
-    ggml_backend_tensor_set(io.H_in,    H_in,    0, n_tokens * d_model * sizeof(float));
-    ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
-    ggml_backend_tensor_set(io.kq_mask, kq_mask, 0, n_total * n_tokens * sizeof(float));
+    ggml_backend_tensor_set(io.H_in, H_in, 0, n_tokens * d_model * sizeof(float));
+    if (io.pos_ids) {
+        ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
+    }
+    if (io.kq_mask) {
+        ggml_backend_tensor_set(io.kq_mask, kq_mask, 0, n_total * n_tokens * sizeof(float));
+    }
 
     if (ggml_backend_graph_compute(backend_, io.graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[-] ReasoningEngine: Graph execution failed at local layer %d (global %d)\n",

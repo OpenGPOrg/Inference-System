@@ -6,6 +6,7 @@
 #include "reasoner/model_config.h"
 #include "reasoner/weight_store.h"
 #include "reasoner/kv_cache.h"
+#include "reasoner/recurrent_cache.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -75,9 +76,10 @@ public:
 
     const ModelConfig &      get_config() const { return config_; }
     const ReasoningOptions & get_options() const { return options_; }
-    const LayerRange &       get_layer_range() const { return layer_range_; }
-    const WeightStore &      get_weight_store() const { return weights_; }
-    const KVCache &          get_kv_cache() const { return kv_cache_; }
+    const LayerRange &          get_layer_range() const { return layer_range_; }
+    const WeightStore &         get_weight_store() const { return weights_; }
+    const KVCache &             get_kv_cache() const { return kv_cache_; }
+    const RecurrentStateCache & get_recurrent_cache() const { return recurrent_cache_; }
 
     bool               is_gpu_active() const { return is_gpu_; }
     const std::string & get_backend_name() const { return backend_name_; }
@@ -102,9 +104,10 @@ private:
     int            active_threads_ = 1;
     std::string    backend_name_;
 
-    WeightStore weights_;
-    KVCache     kv_cache_;
-    size_t      active_ctx_size_    = 0;
+    WeightStore         weights_;
+    KVCache             kv_cache_;
+    RecurrentStateCache recurrent_cache_;
+    size_t              active_ctx_size_    = 0;
     size_t      peak_scratch_bytes_ = 0;
     bool        is_initialized_     = false;
 };

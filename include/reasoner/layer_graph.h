@@ -4,6 +4,7 @@
 #include "reasoner/model_config.h"
 #include "reasoner/weight_store.h"
 #include "reasoner/kv_cache.h"
+#include "reasoner/recurrent_cache.h"
 
 namespace opengp {
 namespace reasoner {
@@ -16,12 +17,13 @@ struct LayerGraphIO {
     struct ggml_cgraph * graph   = nullptr;
 };
 
-// Build computation graph for one Transformer block (Pre-RMSNorm -> QKV/QK-Norm/RoPE -> KV write -> GQA/MHA -> SwiGLU)
+// Build computation graph for one block (Standard Attention, Gated Attention, or Gated DeltaNet SSM)
 LayerGraphIO build_layer_graph(struct ggml_context *      ctx,
                                const ModelConfig &        cfg,
                                const LayerWeights &       w,
                                const struct ggml_tensor * rope_freqs,
                                KVCache &                  kv,
+                               RecurrentStateCache *      recurrent_cache,
                                int                        layer_idx,
                                int                        n_tokens,
                                int                        n_past);

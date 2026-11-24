@@ -267,6 +267,7 @@ int main(int argc, char ** argv) {
     const auto & emb = perception.get_embed_table();
     const auto & ws  = reasoning.get_weight_store();
     const auto & kv  = reasoning.get_kv_cache();
+    const auto & ssm = reasoning.get_recurrent_cache();
     const auto & lm  = responding.get_lm_head();
     std::cout << "[Perception] Device : Host RAM mmap (0.00 MB VRAM) | ["
               << emb.get_vocab_size() << " x " << emb.get_d_model() << "] ("
@@ -282,11 +283,17 @@ int main(int argc, char ** argv) {
         std::cout << " (100% Host mmap, "
                   << std::setprecision(1) << (ws.get_total_weight_bytes() / (1024.0 * 1024.0)) << " MB)";
     }
-    std::cout << "\n[KV Cache]   Memory : " << (reasoning.is_gpu_active() ? "CUDA VRAM" : "Host RAM")
+    std::cout << "\n[KV Cache]   Memory : " << (reasoning.is_gpu_active() ? "Device VRAM" : "Host RAM")
               << " | allocated=" << std::setprecision(2) << (kv.total_bytes() / (1024.0 * 1024.0))
               << " MB (ctx=" << kv.get_capacity() << " tokens, "
+              << kv.get_n_attn_layers() << " attn layers, "
               << std::setprecision(1) << (kv.bytes_per_token() / 1024.0) << " KB/tok, "
               << ggml_type_name(kv.get_dtype()) << ")\n";
+    if (ssm.get_n_ssm_layers() > 0) {
+        std::cout << "[SSM State]  Memory : " << (reasoning.is_gpu_active() ? "Device VRAM" : "Host RAM")
+                  << " | allocated=" << std::setprecision(2) << (ssm.total_bytes() / (1024.0 * 1024.0))
+                  << " MB (" << ssm.get_n_ssm_layers() << " SSM layers, fixed O(1))\n";
+    }
     std::cout << "[LM Head]    Device : " << lm.get_backend_name()
               << (lm.is_tied() ? " (tied token_embd)" : "")
               << " | [" << lm.get_d_model() << " x " << lm.get_vocab_size() << "] ("

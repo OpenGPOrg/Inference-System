@@ -72,6 +72,17 @@ struct ModelConfig {
     float   rope_freq_base = 10000.0f;
     int32_t rope_mode      = 0; // GGML_ROPE_TYPE_NORM (0) or GGML_ROPE_TYPE_NEOX (2)
 
+    // Hybrid SSM / Gated DeltaNet parameters (0 if pure Attention model)
+    int32_t ssm_conv_kernel         = 0;
+    int32_t ssm_state_size          = 0;
+    int32_t ssm_group_count         = 0;
+    int32_t ssm_time_step_rank      = 0;
+    int32_t ssm_inner_size          = 0;
+    int32_t full_attention_interval = 0;
+    int32_t nextn_predict_layers    = 0;
+
+    bool is_hybrid_ssm() const { return ssm_state_size > 0 && ssm_inner_size > 0; }
+
     bool load_from_gguf(const struct gguf_context * gctx, const ReasoningOptions & opts);
     void print_summary() const;
 };
