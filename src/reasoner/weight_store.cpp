@@ -1,4 +1,4 @@
-#include "reasoning/weight_store.h"
+#include "reasoner/weight_store.h"
 #include "ggml-alloc.h"
 #include "gguf.h"
 
@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 namespace {
 
@@ -436,5 +436,5 @@ const LayerWeights & WeightStore::prepare_layer(int layer_idx) {
     return stage_weights_;
 }
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

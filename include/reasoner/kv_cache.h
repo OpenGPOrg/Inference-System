@@ -2,13 +2,13 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "reasoning/model_config.h"
+#include "reasoner/model_config.h"
 
 #include <cstddef>
 #include <vector>
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 // Dynamically growable per-layer KV Cache allocated on the active compute backend
 class KVCache {
@@ -22,11 +22,10 @@ public:
     bool init(const ModelConfig & config,
               int                 n_local_layers,
               ggml_backend_t      backend,
-              KVPrecision         precision,
-              size_t              block_size);
+              KVPrecision         precision);
 
-    // Ensures storage can hold at least `required_tokens`, preserving [0 .. n_past_-1] if grown
-    bool ensure_capacity(size_t required_tokens);
+    // Pre-allocates fixed KV cache capacity [d_head * n_kv_heads, capacity] per owned layer
+    bool allocate(size_t capacity);
 
     // Graph views for writing current token slice [n_past .. n_past + n_tokens - 1]
     struct ggml_tensor * write_view_k(struct ggml_context * ctx, int local_layer_idx, size_t n_past, size_t n_tokens) const;
@@ -52,8 +51,7 @@ private:
     ModelConfig    config_;
     int            n_local_layers_ = 0;
     ggml_backend_t backend_        = nullptr;
-    enum ggml_type dtype_      = GGML_TYPE_F16;
-    size_t         block_size_ = 256;
+    enum ggml_type dtype_          = GGML_TYPE_F16;
 
     size_t n_past_   = 0;
     size_t capacity_ = 0;
@@ -65,5 +63,5 @@ private:
     std::vector<struct ggml_tensor *> v_layers_; // [d_head_v * n_kv_heads, capacity]
 };
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

@@ -1,4 +1,4 @@
-#include "reasoning/model_config.h"
+#include "reasoner/model_config.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -7,7 +7,7 @@
 #include <string>
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 namespace {
 
@@ -106,5 +106,5 @@ void ModelConfig::print_summary() const {
                 rope_dim, rope_freq_base, (rope_mode == kRopeTypeNeox ? "NEOX" : "NORM"), context_length);
 }
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

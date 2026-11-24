@@ -1,5 +1,5 @@
-#include "reasoning/reasoning_engine.h"
-#include "reasoning/layer_graph.h"
+#include "reasoner/reasoner_engine.h"
+#include "reasoner/layer_graph.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -16,7 +16,7 @@
 #include <thread>
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 namespace {
 
@@ -50,6 +50,7 @@ void ReasoningEngine::cleanup() {
         gctx_ = nullptr;
     }
     is_initialized_     = false;
+    active_ctx_size_    = 0;
     peak_scratch_bytes_ = 0;
 }
 
@@ -142,26 +143,59 @@ bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
         return false;
     }
 
-    if (!kv_cache_.init(config_, layer_range_.count(), backend_, options_.kv_precision, options_.kv_block_size)) {
+    if (!kv_cache_.init(config_, layer_range_.count(), backend_, options_.kv_precision)) {
         cleanup();
         return false;
     }
 
-    // Query available VRAM so WeightStore leaves sufficient room for KV growth + 1-layer scratch
+    // Allocate fixed KV cache upfront (default 512 tokens), halving by 2 if memory is insufficient
+    const size_t requested_ctx = (options_.ctx_size > 0) ? options_.ctx_size : 512;
+    size_t       target_ctx    = requested_ctx;
+
+    const float util = std::clamp(options_.vram_utilization, 0.10f, 0.95f);
+    size_t max_kv_vram = 0;
+#if OPENGP_HAS_CUDA
+    if (is_gpu_) {
+        size_t free_vram = 0, total_vram = 0;
+        ggml_backend_cuda_get_device_memory(options_.gpu_device_id, &free_vram, &total_vram);
+        size_t usable_vram    = static_cast<size_t>(static_cast<double>(free_vram) * util);
+        size_t min_non_kv     = 512ULL * 1024ULL * 1024ULL; // Reserve headroom for staging layer + scratch
+        max_kv_vram           = (usable_vram > min_non_kv) ? (usable_vram - min_non_kv) : (usable_vram / 2);
+    }
+#endif
+
+    while (target_ctx >= 1) {
+        if (is_gpu_ && kv_cache_.bytes_per_token() * target_ctx > max_kv_vram) {
+            target_ctx /= 2;
+            continue;
+        }
+        if (kv_cache_.allocate(target_ctx)) {
+            break;
+        }
+        target_ctx /= 2;
+    }
+
+    if (target_ctx == 0) {
+        std::fprintf(stderr, "[-] ReasoningEngine: Unable to allocate KV cache even for 1 token\n");
+        cleanup();
+        return false;
+    }
+    if (target_ctx < requested_ctx) {
+        std::printf("[!] ReasoningEngine: Insufficient memory for ctx_size=%zu, halved to ctx_size=%zu (%.2f MB KV)\n",
+                    requested_ctx, target_ctx, kv_cache_.total_bytes() / (1024.0 * 1024.0));
+    }
+    active_ctx_size_ = target_ctx;
+
+    // Query remaining VRAM after KV allocation so WeightStore assigns resident vs streamed layers cleanly
     size_t weight_vram_budget = 0;
 #if OPENGP_HAS_CUDA
     if (is_gpu_) {
         size_t free_vram = 0, total_vram = 0;
         ggml_backend_cuda_get_device_memory(options_.gpu_device_id, &free_vram, &total_vram);
 
-        float util = std::clamp(options_.vram_utilization, 0.10f, 0.95f);
-        size_t usable_vram = static_cast<size_t>(static_cast<double>(free_vram) * util);
-        // Reserve space for initial KV blocks and single-layer activation scratch
-        size_t kv_reserve      = kv_cache_.bytes_per_token() * options_.kv_block_size * 4;
+        size_t usable_vram     = static_cast<size_t>(static_cast<double>(free_vram) * util);
         size_t scratch_reserve = 256ULL * 1024ULL * 1024ULL;
-        size_t total_reserve   = kv_reserve + scratch_reserve;
-
-        weight_vram_budget = (usable_vram > total_reserve) ? (usable_vram - total_reserve) : (usable_vram / 2);
+        weight_vram_budget     = (usable_vram > scratch_reserve) ? (usable_vram - scratch_reserve) : (usable_vram / 2);
     }
 #endif
 
@@ -248,7 +282,9 @@ bool ReasoningEngine::forward(const float *     H_0,
     const size_t d_model = static_cast<size_t>(config_.d_model);
     const int    n_local = layer_range_.count();
 
-    if (!kv_cache_.ensure_capacity(n_total)) {
+    if (n_total > kv_cache_.get_capacity()) {
+        std::fprintf(stderr, "[-] ReasoningEngine: Context limit reached (%zu > %zu tokens)\n",
+                     n_total, kv_cache_.get_capacity());
         return false;
     }
 
@@ -391,5 +427,5 @@ bool ReasoningEngine::compute_logits_for_vector(const float *        hidden_vec,
     return ok;
 }
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

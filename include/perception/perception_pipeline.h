@@ -40,8 +40,12 @@ public:
                  PerceptionOutput & output, 
                  const std::string & system_prompt = "");
 
+    // Single-token embedding helper for Phase 3 Autoregressive Decode loop
+    bool embed_token(int32_t token_id, float * out_vec) const;
+
     const TokenizerConfig & get_config() const { return config_; }
-    const EmbedTable & get_embed_table() const { return embed_table_; }
+    const BpeEngine &       get_bpe_engine() const { return bpe_engine_; }
+    const EmbedTable &      get_embed_table() const { return embed_table_; }
 
 private:
     std::string model_filepath_;

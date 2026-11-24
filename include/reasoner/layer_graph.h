@@ -1,12 +1,12 @@
 #pragma once
 
 #include "ggml.h"
-#include "reasoning/model_config.h"
-#include "reasoning/weight_store.h"
-#include "reasoning/kv_cache.h"
+#include "reasoner/model_config.h"
+#include "reasoner/weight_store.h"
+#include "reasoner/kv_cache.h"
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 struct LayerGraphIO {
     struct ggml_tensor * H_in    = nullptr; // [d_model, n_tokens] (F32)
@@ -38,5 +38,5 @@ FinalNormGraphIO build_final_norm_graph(struct ggml_context *      ctx,
                                         const struct ggml_tensor * output_norm,
                                         int                        n_tokens);
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

@@ -2,7 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "reasoning/model_config.h"
+#include "reasoner/model_config.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +12,7 @@
 struct gguf_context;
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 // Tensor descriptors for a single Transformer block (blk.<l>.*)
 struct LayerWeights {
@@ -116,5 +116,5 @@ private:
     size_t vram_used_bytes_    = 0;
 };
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

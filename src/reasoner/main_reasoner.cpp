@@ -1,5 +1,5 @@
 #include "perception/perception_pipeline.h"
-#include "reasoning/reasoning_engine.h"
+#include "reasoner/reasoner_engine.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -14,12 +14,12 @@
 
 using opengp::perception::PerceptionOutput;
 using opengp::perception::PerceptionPipeline;
-using opengp::reasoning::DevicePreference;
-using opengp::reasoning::KVPrecision;
-using opengp::reasoning::ReasoningEngine;
-using opengp::reasoning::ReasoningOptions;
-using opengp::reasoning::ReasoningOutput;
-using opengp::reasoning::RopeTypeOverride;
+using opengp::reasoner::DevicePreference;
+using opengp::reasoner::KVPrecision;
+using opengp::reasoner::ReasoningEngine;
+using opengp::reasoner::ReasoningOptions;
+using opengp::reasoner::ReasoningOutput;
+using opengp::reasoner::RopeTypeOverride;
 
 namespace {
 
@@ -33,7 +33,7 @@ void print_usage(const char * prog) {
               << "  --gpu-id <id>            CUDA device index (default: 0)\n"
               << "  --threads <N>            CPU worker threads (default: 0 = auto)\n"
               << "  --kv-precision f16|f32   KV cache element precision (default: f16)\n"
-              << "  --kv-block <N>           Dynamic KV growth block size (default: 256)\n"
+              << "  --ctx-size <N>           Fixed context window size (default: 512; halved on init if VRAM low)\n"
               << "  --vram-util <0.1-0.95>   Max fraction of free VRAM to use (default: 0.80)\n"
               << "  --rope-type auto|norm|neox  Override RoPE layout (default: auto)\n"
               << "  --layer-start <N>        Inclusive global start layer (default: 0)\n"
@@ -126,7 +126,7 @@ int main(int argc, char ** argv) {
         else if (arg == "--system")      system_prompt = need_val("--system");
         else if (arg == "--gpu-id")      opts.gpu_device_id = std::atoi(need_val("--gpu-id"));
         else if (arg == "--threads")     opts.n_threads     = std::atoi(need_val("--threads"));
-        else if (arg == "--kv-block")    opts.kv_block_size = static_cast<size_t>(std::atoll(need_val("--kv-block")));
+        else if (arg == "--ctx-size")    opts.ctx_size      = static_cast<size_t>(std::atoll(need_val("--ctx-size")));
         else if (arg == "--vram-util")   opts.vram_utilization = static_cast<float>(std::atof(need_val("--vram-util")));
         else if (arg == "--layer-start") opts.layers.start  = std::atoi(need_val("--layer-start"));
         else if (arg == "--layer-end")   opts.layers.end    = std::atoi(need_val("--layer-end"));
@@ -209,6 +209,12 @@ int main(int argc, char ** argv) {
                   << std::fixed << std::setprecision(1) << (ws.get_total_weight_bytes() / (1024.0 * 1024.0))
                   << " MB)\n";
     }
+    const auto & init_kv = engine.get_kv_cache();
+    std::cout << "[KV Cache] Memory       : " << (engine.is_gpu_active() ? "CUDA VRAM" : "Host RAM")
+              << " | allocated=" << std::setprecision(2) << (init_kv.total_bytes() / (1024.0 * 1024.0))
+              << " MB (ctx=" << init_kv.get_capacity() << " tokens, "
+              << std::setprecision(1) << (init_kv.bytes_per_token() / 1024.0) << " KB/tok, "
+              << ggml_type_name(init_kv.get_dtype()) << ")\n";
 
     // Run Prefill forward pass
     ReasoningOutput r_out;
@@ -319,7 +325,7 @@ int main(int argc, char ** argv) {
         std::cout << "-----------------------------------------------------------------\n";
         std::cout << ">>> VERIFYING " << K << "-STAGE MODULAR PIPELINE PARITY (Layers [0.." << L << "))...\n";
 
-        opengp::reasoning::ActivationPacket pkt;
+        opengp::reasoner::ActivationPacket pkt;
         pkt.hidden_states      = p_out.H_0;
         pkt.pos_ids            = p_out.pos_ids;
         pkt.n_tokens           = p_out.n_tokens;
@@ -342,7 +348,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
 
-            opengp::reasoning::ActivationPacket next_pkt;
+            opengp::reasoner::ActivationPacket next_pkt;
             ReasoningOutput                     stage_tel;
             if (!stage.forward_packet(pkt, next_pkt, &stage_tel)) {
                 std::cerr << "[-] Pipeline stage " << s << " forward_packet failed\n";

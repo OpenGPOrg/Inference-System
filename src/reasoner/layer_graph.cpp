@@ -1,9 +1,9 @@
-#include "reasoning/layer_graph.h"
+#include "reasoner/layer_graph.h"
 
 #include <cmath>
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 namespace {
 
@@ -143,5 +143,5 @@ FinalNormGraphIO build_final_norm_graph(struct ggml_context *      ctx,
     return io;
 }
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

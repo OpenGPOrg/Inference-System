@@ -1,10 +1,10 @@
-#include "reasoning/kv_cache.h"
+#include "reasoner/kv_cache.h"
 
 #include <algorithm>
 #include <cstdio>
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 KVCache::KVCache() = default;
 
@@ -30,8 +30,7 @@ void KVCache::cleanup() {
 bool KVCache::init(const ModelConfig & config,
                    int                 n_local_layers,
                    ggml_backend_t      backend,
-                   KVPrecision         precision,
-                   size_t              block_size) {
+                   KVPrecision         precision) {
     cleanup();
     if (!backend || config.n_layers <= 0 || n_local_layers <= 0) return false;
 
@@ -39,7 +38,6 @@ bool KVCache::init(const ModelConfig & config,
     n_local_layers_ = n_local_layers;
     backend_        = backend;
     dtype_          = (precision == KVPrecision::F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
-    block_size_     = (block_size > 0) ? block_size : 256;
     return true;
 }
 
@@ -53,13 +51,23 @@ size_t KVCache::total_bytes() const {
     return buf_ ? ggml_backend_buffer_get_size(buf_) : 0;
 }
 
-bool KVCache::ensure_capacity(size_t required_tokens) {
-    if (required_tokens <= capacity_) {
-        return true;
+bool KVCache::allocate(size_t capacity) {
+    if (!backend_ || n_local_layers_ <= 0 || capacity == 0) {
+        return false;
     }
 
-    const size_t aligned_req = ((required_tokens + block_size_ - 1) / block_size_) * block_size_;
-    const size_t new_cap     = std::max(capacity_ * 2, aligned_req);
+    if (buf_) {
+        ggml_backend_buffer_free(buf_);
+        buf_ = nullptr;
+    }
+    if (ctx_) {
+        ggml_free(ctx_);
+        ctx_ = nullptr;
+    }
+    k_layers_.clear();
+    v_layers_.clear();
+    capacity_ = 0;
+    n_past_   = 0;
 
     const int64_t k_dim = static_cast<int64_t>(config_.d_head_k) * config_.n_kv_heads;
     const int64_t v_dim = static_cast<int64_t>(config_.d_head_v) * config_.n_kv_heads;
@@ -72,42 +80,23 @@ bool KVCache::ensure_capacity(size_t required_tokens) {
     std::vector<struct ggml_tensor *> new_v(n_local_layers_, nullptr);
 
     for (int l = 0; l < n_local_layers_; ++l) {
-        new_k[l] = ggml_new_tensor_2d(new_ctx, dtype_, k_dim, static_cast<int64_t>(new_cap));
-        new_v[l] = ggml_new_tensor_2d(new_ctx, dtype_, v_dim, static_cast<int64_t>(new_cap));
+        new_k[l] = ggml_new_tensor_2d(new_ctx, dtype_, k_dim, static_cast<int64_t>(capacity));
+        new_v[l] = ggml_new_tensor_2d(new_ctx, dtype_, v_dim, static_cast<int64_t>(capacity));
         ggml_format_name(new_k[l], "kv_k_l%d", l);
         ggml_format_name(new_v[l], "kv_v_l%d", l);
     }
 
     ggml_backend_buffer_t new_buf = ggml_backend_alloc_ctx_tensors(new_ctx, backend_);
     if (!new_buf) {
-        std::fprintf(stderr, "[-] KVCache: Failed to allocate KV buffer for %zu tokens\n", new_cap);
         ggml_free(new_ctx);
         return false;
     }
-
-    // Preserve previously cached token states [0 .. n_past_ - 1]
-    if (n_past_ > 0 && buf_) {
-        const size_t k_copy_bytes = n_past_ * k_layers_[0]->nb[1];
-        const size_t v_copy_bytes = n_past_ * v_layers_[0]->nb[1];
-        std::vector<uint8_t> tmp(std::max(k_copy_bytes, v_copy_bytes));
-
-        for (int l = 0; l < n_local_layers_; ++l) {
-            ggml_backend_tensor_get(k_layers_[l], tmp.data(), 0, k_copy_bytes);
-            ggml_backend_tensor_set(new_k[l],    tmp.data(), 0, k_copy_bytes);
-
-            ggml_backend_tensor_get(v_layers_[l], tmp.data(), 0, v_copy_bytes);
-            ggml_backend_tensor_set(new_v[l],    tmp.data(), 0, v_copy_bytes);
-        }
-    }
-
-    if (buf_) ggml_backend_buffer_free(buf_);
-    if (ctx_) ggml_free(ctx_);
 
     ctx_      = new_ctx;
     buf_      = new_buf;
     k_layers_ = std::move(new_k);
     v_layers_ = std::move(new_v);
-    capacity_ = new_cap;
+    capacity_ = capacity;
     return true;
 }
 
@@ -157,5 +146,5 @@ struct ggml_tensor * KVCache::read_view_v(struct ggml_context * ctx,
                         0);
 }
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

@@ -7,7 +7,7 @@
 struct gguf_context;
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 enum class DevicePreference {
     AUTO, // Prefer CUDA GPU if present at runtime, fall back to multi-threaded CPU
@@ -47,7 +47,7 @@ struct ReasoningOptions {
     int              gpu_device_id    = 0;
     int              n_threads        = 0;     // 0 = auto-detect hardware concurrency
     KVPrecision      kv_precision     = KVPrecision::F16;
-    size_t           kv_block_size    = 256;   // Dynamic growth granularity (no upper cap)
+    size_t           ctx_size         = 512;   // Fixed upfront context size (halved at init if memory insufficient)
     float            vram_utilization = 0.80f; // Fraction of free VRAM usable for resident weights + KV
     RopeTypeOverride rope_type        = RopeTypeOverride::AUTO;
     LayerRange       layers;                   // Subset of layers to load & execute (for modular/distributed nodes)
@@ -76,5 +76,5 @@ struct ModelConfig {
     void print_summary() const;
 };
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

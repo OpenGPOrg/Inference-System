@@ -27,6 +27,7 @@ public:
     std::string id_to_token(int32_t id) const;
 
     const std::unordered_map<uint8_t, std::string> & byte_to_unicode() const { return byte_to_unicode_; }
+    const std::unordered_map<std::string, uint8_t> & unicode_to_byte() const { return unicode_to_byte_; }
 
 private:
     void init_byte_mappings();

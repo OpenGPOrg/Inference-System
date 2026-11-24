@@ -3,9 +3,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
-#include "reasoning/model_config.h"
-#include "reasoning/weight_store.h"
-#include "reasoning/kv_cache.h"
+#include "reasoner/model_config.h"
+#include "reasoner/weight_store.h"
+#include "reasoner/kv_cache.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +15,7 @@
 struct gguf_context;
 
 namespace opengp {
-namespace reasoning {
+namespace reasoner {
 
 struct ReasoningOutput {
     std::vector<float> H_L;             // Contiguous FP32 hidden states after owned layer range [n_tokens * d_model]
@@ -82,6 +82,7 @@ public:
     bool               is_gpu_active() const { return is_gpu_; }
     const std::string & get_backend_name() const { return backend_name_; }
     int                get_active_threads() const { return active_threads_; }
+    size_t             get_ctx_size() const { return active_ctx_size_; }
     size_t             get_scratch_bytes() const { return peak_scratch_bytes_; }
 
 private:
@@ -103,9 +104,10 @@ private:
 
     WeightStore weights_;
     KVCache     kv_cache_;
+    size_t      active_ctx_size_    = 0;
     size_t      peak_scratch_bytes_ = 0;
     bool        is_initialized_     = false;
 };
 
-} // namespace reasoning
+} // namespace reasoner
 } // namespace opengp

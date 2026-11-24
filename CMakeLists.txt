@@ -37,20 +37,38 @@ add_executable(opengp_perception src/perception/main_perception.cpp)
 target_link_libraries(opengp_perception PRIVATE opengp_perception_core)
 
 # -----------------------------------------------------------------------------
-# 4. Modular Reasoning Engine Core Library (Phase 2)
+# 4. Modular Reasoner Engine Core Library (Phase 2)
 # -----------------------------------------------------------------------------
-add_library(opengp_reasoning_core STATIC
-    src/reasoning/model_config.cpp
-    src/reasoning/weight_store.cpp
-    src/reasoning/kv_cache.cpp
-    src/reasoning/layer_graph.cpp
-    src/reasoning/reasoning_engine.cpp
+add_library(opengp_reasoner_core STATIC
+    src/reasoner/model_config.cpp
+    src/reasoner/weight_store.cpp
+    src/reasoner/kv_cache.cpp
+    src/reasoner/layer_graph.cpp
+    src/reasoner/reasoner_engine.cpp
 )
 
-target_link_libraries(opengp_reasoning_core PUBLIC ggml opengp_perception_core)
+target_link_libraries(opengp_reasoner_core PUBLIC ggml opengp_perception_core)
 
 # -----------------------------------------------------------------------------
-# 5. Dedicated Reasoning Engine CLI Executable
+# 5. Dedicated Reasoner Engine CLI Executable
 # -----------------------------------------------------------------------------
-add_executable(opengp_reasoning src/reasoning/main_reasoning.cpp)
-target_link_libraries(opengp_reasoning PRIVATE opengp_reasoning_core)
+add_executable(opengp_reasoner src/reasoner/main_reasoner.cpp)
+target_link_libraries(opengp_reasoner PRIVATE opengp_reasoner_core)
+
+# -----------------------------------------------------------------------------
+# 6. Modular Responder Engine Core Library (Phase 3)
+# -----------------------------------------------------------------------------
+add_library(opengp_responder_core STATIC
+    src/responder/lm_head.cpp
+    src/responder/sampler.cpp
+    src/responder/detokenizer.cpp
+    src/responder/responder_engine.cpp
+)
+
+target_link_libraries(opengp_responder_core PUBLIC ggml opengp_perception_core opengp_reasoner_core)
+
+# -----------------------------------------------------------------------------
+# 7. Unified End-to-End Inference CLI Executable (Phase 1 -> 2 -> 3)
+# -----------------------------------------------------------------------------
+add_executable(opengp_infer src/responder/main_infer.cpp)
+target_link_libraries(opengp_infer PRIVATE opengp_responder_core)

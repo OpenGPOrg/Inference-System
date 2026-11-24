@@ -132,11 +132,14 @@ struct BpeNode {
 struct BpeCandidate {
     int32_t rank;
     int32_t merged_id;
+    int32_t left_id;
+    int32_t right_id;
     BpeNode * left;
     BpeNode * right;
 
     bool operator>(const BpeCandidate & other) const {
-        return rank > other.rank; // min-heap
+        if (rank != other.rank) return rank > other.rank; // min-heap by rank
+        return left->index > other.left->index;           // tie-break left-to-right
     }
 };
 
@@ -190,7 +193,9 @@ void BpeEngine::bpe_tournament(const std::string & chunk, std::vector<int32_t> &
         uint64_t key = ((uint64_t)(uint32_t)nodes[i].token_id << 32) | (uint32_t)nodes[i + 1].token_id;
         auto it = merges_map_.find(key);
         if (it != merges_map_.end()) {
-            min_heap.push({ it->second.rank, it->second.merged_id, &nodes[i], &nodes[i + 1] });
+            min_heap.push({ it->second.rank, it->second.merged_id,
+                            nodes[i].token_id, nodes[i + 1].token_id,
+                            &nodes[i], &nodes[i + 1] });
         }
     }
 
@@ -202,8 +207,9 @@ void BpeEngine::bpe_tournament(const std::string & chunk, std::vector<int32_t> &
         BpeNode * left = top.left;
         BpeNode * right = top.right;
 
-        // Lazy deletion verification
-        if (left->deleted || right->deleted || left->next != right) {
+        // Lazy deletion & token-version verification (prevents stale candidates clobbering merged nodes)
+        if (left->deleted || right->deleted || left->next != right ||
+            left->token_id != top.left_id || right->token_id != top.right_id) {
             continue;
         }
 
@@ -220,7 +226,9 @@ void BpeEngine::bpe_tournament(const std::string & chunk, std::vector<int32_t> &
             uint64_t l_key = ((uint64_t)(uint32_t)left->prev->token_id << 32) | (uint32_t)left->token_id;
             auto it_l = merges_map_.find(l_key);
             if (it_l != merges_map_.end()) {
-                min_heap.push({ it_l->second.rank, it_l->second.merged_id, left->prev, left });
+                min_heap.push({ it_l->second.rank, it_l->second.merged_id,
+                                left->prev->token_id, left->token_id,
+                                left->prev, left });
             }
         }
 
@@ -228,7 +236,9 @@ void BpeEngine::bpe_tournament(const std::string & chunk, std::vector<int32_t> &
             uint64_t r_key = ((uint64_t)(uint32_t)left->token_id << 32) | (uint32_t)left->next->token_id;
             auto it_r = merges_map_.find(r_key);
             if (it_r != merges_map_.end()) {
-                min_heap.push({ it_r->second.rank, it_r->second.merged_id, left, left->next });
+                min_heap.push({ it_r->second.rank, it_r->second.merged_id,
+                                left->token_id, left->next->token_id,
+                                left, left->next });
             }
         }
     }

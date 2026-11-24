@@ -99,5 +99,15 @@ bool PerceptionPipeline::process(const std::string & user_prompt,
     return ok;
 }
 
+bool PerceptionPipeline::embed_token(int32_t token_id, float * out_vec) const {
+    if (!is_initialized_ || !out_vec) return false;
+
+    float scale = 1.0f;
+    if (config_.model_architecture.find("gemma") != std::string::npos) {
+        scale = std::sqrt(static_cast<float>(embed_table_.get_d_model()));
+    }
+    return embed_table_.gather_and_dequant({ token_id }, out_vec, scale);
+}
+
 } // namespace perception
 } // namespace opengp
