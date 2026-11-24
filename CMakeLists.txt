@@ -35,3 +35,22 @@ target_link_libraries(opengp_perception_core PUBLIC ggml)
 # -----------------------------------------------------------------------------
 add_executable(opengp_perception src/perception/main_perception.cpp)
 target_link_libraries(opengp_perception PRIVATE opengp_perception_core)
+
+# -----------------------------------------------------------------------------
+# 4. Modular Reasoning Engine Core Library (Phase 2)
+# -----------------------------------------------------------------------------
+add_library(opengp_reasoning_core STATIC
+    src/reasoning/model_config.cpp
+    src/reasoning/weight_store.cpp
+    src/reasoning/kv_cache.cpp
+    src/reasoning/layer_graph.cpp
+    src/reasoning/reasoning_engine.cpp
+)
+
+target_link_libraries(opengp_reasoning_core PUBLIC ggml opengp_perception_core)
+
+# -----------------------------------------------------------------------------
+# 5. Dedicated Reasoning Engine CLI Executable
+# -----------------------------------------------------------------------------
+add_executable(opengp_reasoning src/reasoning/main_reasoning.cpp)
+target_link_libraries(opengp_reasoning PRIVATE opengp_reasoning_core)
