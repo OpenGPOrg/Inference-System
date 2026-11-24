@@ -171,9 +171,9 @@ Key architectural behaviors in the computation graph:
 
 ## 2.1 Core Architectural Principles
 
-1. **100% Self-Contained Repository:** All GGML, GGUF, CPU SIMD (`arch/x86`, `arch/arm`), and CUDA (`vendor/ggml/src/ggml-cuda`) kernels are vendored in-tree under `opengp/vendor/ggml/`. Zero external `llama.cpp` or parent-directory dependencies.
+1. **100% Self-Contained Repository:** All GGML, GGUF, CPU SIMD (`arch/x86`, `arch/arm`), CUDA (`vendor/ggml/src/ggml-cuda`), and Apple Metal (`vendor/ggml/src/ggml-metal`) kernels are vendored in-tree under `opengp/vendor/ggml/`. Zero external `llama.cpp` or parent-directory dependencies.
 2. **Model-Agnostic Dynamic Discovery:** Zero hardcoded model names, dimensions, stop IDs, or RoPE constants. Every hyperparameter and tensor layout is driven dynamically by GGUF metadata (`general.architecture`, `<arch>.*`) and tensor lookup.
-3. **Hardware Portability (GPU-First with Automatic CPU Fallback):** Automatically initializes CUDA GPU when present (`OPENGP_HAS_CUDA=1` and `device_count > 0`) and seamlessly falls back to multi-threaded CPU (`ggml_backend_cpu_init`) on CPU-only systems.
+3. **Hardware Portability (GPU-First with Automatic CPU Fallback):** Automatically initializes NVIDIA CUDA (`OPENGP_HAS_CUDA=1`) or Apple Metal (`OPENGP_HAS_METAL=1`) when present and seamlessly falls back to multi-threaded CPU (`ggml_backend_cpu_init`) on CPU-only systems.
 4. **Deterministic Memory Budgeting:** Allocates fixed KV Cache up front (default `512`, auto-halving on init if VRAM is tight), then pins as many Transformer layers as fit in remaining VRAM while streaming overflow layers over a single reusable GPU staging buffer from zero-copy Host `mmap`.
 
 ---
@@ -307,7 +307,7 @@ GPU VRAM (RTX 3060 — 5,806 MiB)                        Host RAM (Zero-Copy mma
 ## 2.8 Build System & Developer Workflows
 
 - **CMake ([CMakeLists.txt](file:///media/vithurshan/vithu/opengp/ggml/opengp/CMakeLists.txt) & [vendor/ggml/CMakeLists.txt](file:///media/vithurshan/vithu/opengp/ggml/opengp/vendor/ggml/CMakeLists.txt)):**
-  - Automatically detects `CUDAToolkit`; builds `ggml-cuda` (`OPENGP_HAS_CUDA=1`) when present, or CPU-only (`OPENGP_HAS_CUDA=0`) with native SIMD (`-march=native`) otherwise.
+  - Automatically detects `CUDAToolkit` (`OPENGP_HAS_CUDA=1`) and macOS Metal frameworks (`OPENGP_HAS_METAL=1` with embedded `.metal` shaders), or builds CPU-only with native SIMD (`-march=native`) otherwise.
   - Compiles static core libraries `opengp_perception_core`, `opengp_reasoner_core`, `opengp_responder_core` and 3 executables: `opengp_perception`, `opengp_reasoner`, `opengp_infer`.
 - **Incremental `Makefile` ([Makefile](file:///media/vithurshan/vithu/opengp/ggml/opengp/Makefile)):**
   - `make` — Configures (if needed) and builds all targets in Release mode using all CPU cores.

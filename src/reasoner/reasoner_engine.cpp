@@ -7,6 +7,10 @@
 #include "ggml-cuda.h"
 #endif
 
+#if OPENGP_HAS_METAL
+#include "ggml-metal.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -55,42 +59,38 @@ void ReasoningEngine::cleanup() {
 }
 
 bool ReasoningEngine::init_backend() {
-    bool use_gpu = false;
+    const bool want_gpu = (options_.device == DevicePreference::GPU || options_.device == DevicePreference::AUTO);
 
+    if (want_gpu) {
 #if OPENGP_HAS_CUDA
-    const int gpu_count = ggml_backend_cuda_get_device_count();
-    if (options_.device == DevicePreference::GPU) {
-        if (gpu_count <= 0 || options_.gpu_device_id >= gpu_count) {
-            std::fprintf(stderr, "[-] ReasoningEngine: GPU requested, but CUDA device %d not found (count=%d)\n",
-                         options_.gpu_device_id, gpu_count);
-            return false;
+        const int gpu_count = ggml_backend_cuda_get_device_count();
+        if (gpu_count > 0 && options_.gpu_device_id >= 0 && options_.gpu_device_id < gpu_count) {
+            backend_ = ggml_backend_cuda_init(options_.gpu_device_id);
+            if (backend_) {
+                char desc[256] = {};
+                ggml_backend_cuda_get_device_description(options_.gpu_device_id, desc, sizeof(desc));
+                backend_name_ = std::string("CUDA (") + desc + ")";
+                is_gpu_       = true;
+                return true;
+            }
         }
-        use_gpu = true;
-    } else if (options_.device == DevicePreference::AUTO) {
-        use_gpu = (gpu_count > 0 && options_.gpu_device_id < gpu_count);
-    }
-#else
-    if (options_.device == DevicePreference::GPU) {
-        std::fprintf(stderr, "[-] ReasoningEngine: GPU requested, but compiled without CUDA support\n");
-        return false;
-    }
 #endif
 
-    if (use_gpu) {
-#if OPENGP_HAS_CUDA
-        backend_ = ggml_backend_cuda_init(options_.gpu_device_id);
+#if OPENGP_HAS_METAL
+        backend_ = ggml_backend_metal_init();
         if (backend_) {
-            char desc[256] = {};
-            ggml_backend_cuda_get_device_description(options_.gpu_device_id, desc, sizeof(desc));
-            backend_name_ = std::string("CUDA (") + desc + ")";
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+            const char * desc = dev ? ggml_backend_dev_description(dev) : "Apple GPU";
+            backend_name_ = std::string("Metal (") + (desc ? desc : "Apple GPU") + ")";
             is_gpu_       = true;
             return true;
         }
+#endif
+
         if (options_.device == DevicePreference::GPU) {
-            std::fprintf(stderr, "[-] ReasoningEngine: ggml_backend_cuda_init failed\n");
+            std::fprintf(stderr, "[-] ReasoningEngine: GPU requested, but no CUDA or Metal device available\n");
             return false;
         }
-#endif
     }
 
     // Multi-threaded CPU backend (primary when CPU-only, automatic fallback when no GPU)
@@ -154,15 +154,16 @@ bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
 
     const float util = std::clamp(options_.vram_utilization, 0.10f, 0.95f);
     size_t max_kv_vram = 0;
-#if OPENGP_HAS_CUDA
     if (is_gpu_) {
         size_t free_vram = 0, total_vram = 0;
-        ggml_backend_cuda_get_device_memory(options_.gpu_device_id, &free_vram, &total_vram);
-        size_t usable_vram    = static_cast<size_t>(static_cast<double>(free_vram) * util);
-        size_t min_non_kv     = 512ULL * 1024ULL * 1024ULL; // Reserve headroom for staging layer + scratch
-        max_kv_vram           = (usable_vram > min_non_kv) ? (usable_vram - min_non_kv) : (usable_vram / 2);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+        }
+        size_t usable_vram = static_cast<size_t>(static_cast<double>(free_vram) * util);
+        size_t min_non_kv  = 512ULL * 1024ULL * 1024ULL; // Reserve headroom for staging layer + scratch
+        max_kv_vram        = (usable_vram > min_non_kv) ? (usable_vram - min_non_kv) : (usable_vram / 2);
     }
-#endif
 
     while (target_ctx >= 1) {
         if (is_gpu_ && kv_cache_.bytes_per_token() * target_ctx > max_kv_vram) {
@@ -188,16 +189,17 @@ bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
 
     // Query remaining VRAM after KV allocation so WeightStore assigns resident vs streamed layers cleanly
     size_t weight_vram_budget = 0;
-#if OPENGP_HAS_CUDA
     if (is_gpu_) {
         size_t free_vram = 0, total_vram = 0;
-        ggml_backend_cuda_get_device_memory(options_.gpu_device_id, &free_vram, &total_vram);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+        }
 
         size_t usable_vram     = static_cast<size_t>(static_cast<double>(free_vram) * util);
         size_t scratch_reserve = 256ULL * 1024ULL * 1024ULL;
         weight_vram_budget     = (usable_vram > scratch_reserve) ? (usable_vram - scratch_reserve) : (usable_vram / 2);
     }
-#endif
 
     if (!weights_.init(gguf_filepath, gctx_, config_, layer_range_, backend_, is_gpu_, weight_vram_budget)) {
         cleanup();

@@ -6,6 +6,10 @@
 #include "ggml-cuda.h"
 #endif
 
+#if OPENGP_HAS_METAL
+#include "ggml-metal.h"
+#endif
+
 #include <algorithm>
 #include <cstdio>
 #include <fcntl.h>
@@ -135,56 +139,71 @@ bool LmHead::init(const std::string & gguf_filepath,
     host_w_->data = static_cast<uint8_t *>(mmap_addr_) + data_offset + tensor_off;
     gguf_free(gctx);
 
-    // Choose backend: GPU if requested or AUTO with sufficient free VRAM headroom, else CPU mmap
-    bool try_gpu = false;
-#if OPENGP_HAS_CUDA
-    const int gpu_count = ggml_backend_cuda_get_device_count();
-    if (device_pref == LmHeadDevice::GPU) {
-        if (gpu_count <= 0 || gpu_device_id >= gpu_count) {
-            std::fprintf(stderr, "[-] LmHead: GPU requested, but CUDA device %d unavailable\n", gpu_device_id);
-            cleanup();
-            return false;
-        }
-        try_gpu = true;
-    } else if (device_pref == LmHeadDevice::AUTO && gpu_count > 0 && gpu_device_id < gpu_count) {
-        size_t free_vram = 0, total_vram = 0;
-        ggml_backend_cuda_get_device_memory(gpu_device_id, &free_vram, &total_vram);
-        constexpr size_t kVramHeadroom = 256ULL * 1024ULL * 1024ULL;
-        try_gpu = (free_vram > weight_bytes_ + kVramHeadroom);
-    }
-#else
-    if (device_pref == LmHeadDevice::GPU) {
-        std::fprintf(stderr, "[-] LmHead: GPU requested, but compiled without CUDA support\n");
-        cleanup();
-        return false;
-    }
-#endif
+    // Choose backend: GPU (CUDA or Apple Metal) if requested or AUTO with sufficient free VRAM headroom, else CPU mmap
+    if (device_pref == LmHeadDevice::GPU || device_pref == LmHeadDevice::AUTO) {
+        ggml_backend_t candidate_gpu = nullptr;
+        std::string    gpu_label;
 
-    if (try_gpu) {
 #if OPENGP_HAS_CUDA
-        backend_ = ggml_backend_cuda_init(gpu_device_id);
-        if (backend_) {
-            gpu_ctx_ = ggml_init({ ggml_tensor_overhead() * 4 + 1024, nullptr, true });
-            active_w_ = ggml_dup_tensor(gpu_ctx_, host_w_);
-            ggml_set_name(active_w_, ggml_get_name(host_w_));
-            gpu_buf_ = ggml_backend_alloc_ctx_tensors(gpu_ctx_, backend_);
-            if (gpu_buf_) {
-                ggml_backend_buffer_set_usage(gpu_buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                ggml_backend_tensor_set(active_w_, host_w_->data, 0, weight_bytes_);
-
+        const int gpu_count = ggml_backend_cuda_get_device_count();
+        if (gpu_count > 0 && gpu_device_id >= 0 && gpu_device_id < gpu_count) {
+            candidate_gpu = ggml_backend_cuda_init(gpu_device_id);
+            if (candidate_gpu) {
                 char desc[256] = {};
                 ggml_backend_cuda_get_device_description(gpu_device_id, desc, sizeof(desc));
-                backend_name_ = std::string("CUDA (") + desc + ")";
-                is_gpu_       = true;
-            } else {
-                // Fall back cleanly to CPU mmap if GPU alloc failed
-                ggml_free(gpu_ctx_);
-                gpu_ctx_ = nullptr;
-                ggml_backend_free(backend_);
-                backend_ = nullptr;
+                gpu_label = std::string("CUDA (") + desc + ")";
             }
         }
 #endif
+
+#if OPENGP_HAS_METAL
+        if (!candidate_gpu) {
+            candidate_gpu = ggml_backend_metal_init();
+            if (candidate_gpu) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(candidate_gpu);
+                const char * desc = dev ? ggml_backend_dev_description(dev) : "Apple GPU";
+                gpu_label = std::string("Metal (") + (desc ? desc : "Apple GPU") + ")";
+            }
+        }
+#endif
+
+        if (candidate_gpu) {
+            bool fits_budget = (device_pref == LmHeadDevice::GPU);
+            if (device_pref == LmHeadDevice::AUTO) {
+                size_t free_vram = 0, total_vram = 0;
+                ggml_backend_dev_t dev = ggml_backend_get_device(candidate_gpu);
+                if (dev) {
+                    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+                }
+                constexpr size_t kVramHeadroom = 256ULL * 1024ULL * 1024ULL;
+                fits_budget = (free_vram > weight_bytes_ + kVramHeadroom);
+            }
+
+            if (fits_budget) {
+                gpu_ctx_  = ggml_init({ ggml_tensor_overhead() * 4 + 1024, nullptr, true });
+                active_w_ = ggml_dup_tensor(gpu_ctx_, host_w_);
+                ggml_set_name(active_w_, ggml_get_name(host_w_));
+                gpu_buf_ = ggml_backend_alloc_ctx_tensors(gpu_ctx_, candidate_gpu);
+                if (gpu_buf_) {
+                    ggml_backend_buffer_set_usage(gpu_buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    ggml_backend_tensor_set(active_w_, host_w_->data, 0, weight_bytes_);
+
+                    backend_      = candidate_gpu;
+                    backend_name_ = gpu_label;
+                    is_gpu_       = true;
+                } else {
+                    ggml_free(gpu_ctx_);
+                    gpu_ctx_ = nullptr;
+                    ggml_backend_free(candidate_gpu);
+                }
+            } else {
+                ggml_backend_free(candidate_gpu);
+            }
+        } else if (device_pref == LmHeadDevice::GPU) {
+            std::fprintf(stderr, "[-] LmHead: GPU requested, but no CUDA or Metal device available\n");
+            cleanup();
+            return false;
+        }
     }
 
     if (!backend_) {
