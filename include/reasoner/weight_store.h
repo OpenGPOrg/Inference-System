@@ -58,6 +58,7 @@ public:
 
     // Returns layer weights ready for compute on `backend` (local_layer_idx in [0 .. get_n_local_layers() - 1])
     const LayerWeights & prepare_layer(int local_layer_idx);
+    void release() { cleanup(); }
 
     const struct ggml_tensor * get_output_norm() const { return output_norm_; }
     const struct ggml_tensor * get_rope_freqs() const { return rope_freqs_; }
