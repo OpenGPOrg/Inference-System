@@ -28,9 +28,16 @@ struct GpuBackendSelection {
 // gpu_device_id < 0 selects automatically (CUDA: device 0; Vulkan: first discrete GPU,
 // else first integrated GPU, skipping software renderers).
 //
-// Never throws. Any Vulkan loader/driver/device/smoke-test failure is recorded in
-// fail_reason so callers can log and seamlessly fall back to CPU.
-GpuBackendSelection select_gpu_backend(int gpu_device_id = -1);
+// For Vulkan integrated GPUs (iGPUs) in AUTO mode (allow_slow_igpu == false), runs a
+// brief cached startup micro-benchmark against multi-threaded CPU (cpu_threads, 0 = auto)
+// and falls back to CPU unless the iGPU is meaningfully faster. Passing allow_slow_igpu = true
+// (e.g., explicit --device gpu) bypasses the speed gate while still verifying correctness.
+//
+// Never throws. Any Vulkan loader/driver/device/smoke-test/benchmark rejection is recorded
+// in fail_reason so callers can log and seamlessly fall back to CPU.
+GpuBackendSelection select_gpu_backend(int  gpu_device_id   = -1,
+                                       int  cpu_threads     = 0,
+                                       bool allow_slow_igpu = false);
 
 } // namespace reasoner
 } // namespace opengp

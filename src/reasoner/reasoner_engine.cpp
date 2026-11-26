@@ -61,7 +61,8 @@ bool ReasoningEngine::init_backend() {
     const bool want_gpu = (options_.device == DevicePreference::GPU || options_.device == DevicePreference::AUTO);
 
     if (want_gpu) {
-        GpuBackendSelection sel = select_gpu_backend(options_.gpu_device_id);
+        const bool allow_slow_igpu = (options_.device == DevicePreference::GPU);
+        GpuBackendSelection sel = select_gpu_backend(options_.gpu_device_id, options_.n_threads, allow_slow_igpu);
         if (sel.backend) {
             backend_      = sel.backend;
             backend_kind_ = sel.kind;

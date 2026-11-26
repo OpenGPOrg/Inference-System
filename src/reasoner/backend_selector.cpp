@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -283,11 +285,183 @@ bool run_vulkan_smoke_test_cached(int vk_dev_idx, ggml_backend_t vk_backend, std
     return ok;
 }
 
+// Micro-benchmark a single Q4_K matvec exceeding typical laptop L3 cache (~9 MB weights)
+// on the given backend, returning average milliseconds per dispatch (or < 0 on failure).
+double bench_q4k_matvec_ms(ggml_backend_t               backend,
+                           int64_t                      K,
+                           int64_t                      M,
+                           const std::vector<uint8_t> & w_q4k,
+                           const std::vector<float> &   x_f32,
+                           int                          warmup_iters,
+                           int                          timed_iters) {
+    struct ggml_context * wctx  = nullptr;
+    ggml_backend_buffer_t wbuf  = nullptr;
+    struct ggml_context * gctx  = nullptr;
+    ggml_gallocr_t        alloc = nullptr;
+
+    auto cleanup = [&]() {
+        if (alloc) ggml_gallocr_free(alloc);
+        if (gctx)  ggml_free(gctx);
+        if (wbuf)  ggml_backend_buffer_free(wbuf);
+        if (wctx)  ggml_free(wctx);
+    };
+
+    try {
+        wctx = ggml_init({ ggml_tensor_overhead() * 4 + 1024, nullptr, true });
+        if (!wctx) { cleanup(); return -1.0; }
+
+        struct ggml_tensor * w = ggml_new_tensor_2d(wctx, GGML_TYPE_Q4_K, K, M);
+        wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+        if (!wbuf) { cleanup(); return -1.0; }
+        ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_tensor_set(w, w_q4k.data(), 0, w_q4k.size());
+
+        gctx = ggml_init({ ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true });
+        if (!gctx) { cleanup(); return -1.0; }
+
+        struct ggml_tensor * x = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, K);
+        ggml_set_input(x);
+        struct ggml_tensor * y = ggml_mul_mat(gctx, w, x);
+        ggml_set_output(y);
+
+        if (!ggml_backend_supports_op(backend, y)) {
+            cleanup();
+            return -1.0;
+        }
+
+        struct ggml_cgraph * gf = ggml_new_graph(gctx);
+        ggml_build_forward_expand(gf, y);
+
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+            cleanup();
+            return -1.0;
+        }
+
+        std::vector<float> y_out(static_cast<size_t>(M));
+        const size_t x_bytes = static_cast<size_t>(K) * sizeof(float);
+        const size_t y_bytes = static_cast<size_t>(M) * sizeof(float);
+
+        for (int i = 0; i < warmup_iters; ++i) {
+            ggml_backend_tensor_set(x, x_f32.data(), 0, x_bytes);
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                cleanup();
+                return -1.0;
+            }
+            ggml_backend_tensor_get(y, y_out.data(), 0, y_bytes);
+        }
+
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < timed_iters; ++i) {
+            ggml_backend_tensor_set(x, x_f32.data(), 0, x_bytes);
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                cleanup();
+                return -1.0;
+            }
+            ggml_backend_tensor_get(y, y_out.data(), 0, y_bytes);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+
+        cleanup();
+        double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return total_ms / static_cast<double>(timed_iters);
+    } catch (...) {
+        cleanup();
+        return -1.0;
+    }
+}
+
+// Compare Vulkan iGPU vs multi-threaded CPU on a ~9 MB Q4_K matvec (cached per device + threads).
+// Returns true iff Vulkan iGPU beats CPU by at least 10%.
+bool vulkan_igpu_beats_cpu_cached(int                 vk_dev_idx,
+                                  const std::string & vk_desc,
+                                  ggml_backend_t      vk_backend,
+                                  int                 cpu_threads,
+                                  std::string &       reject_reason) {
+    const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
+    const int threads    = (cpu_threads > 0) ? cpu_threads : std::max(1, hw_threads);
+    const int64_t key    = (static_cast<int64_t>(vk_dev_idx) << 16) | (threads & 0xFFFF);
+
+    static std::mutex mu;
+    static std::unordered_map<int64_t, std::pair<bool, std::string>> cache;
+
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            reject_reason = it->second.second;
+            return it->second.first;
+        }
+    }
+
+    // 2048 x 8192 Q4_K (~9.0 MB): spills typical laptop L3 cache and reflects decode bandwidth + Q4_K dequant
+    constexpr int64_t K = 2048;
+    constexpr int64_t M = 8192;
+    constexpr int kWarmup = 2;
+    constexpr int kTimed  = 8;
+
+    // Quantize 1 row and tile across M rows (< 0.2 ms setup, guaranteed valid Q4_K format)
+    std::vector<float> row_f32(static_cast<size_t>(K));
+    std::vector<float> x_f32(static_cast<size_t>(K));
+    for (int64_t i = 0; i < K; ++i) {
+        row_f32[static_cast<size_t>(i)] = 0.2f * std::sin(static_cast<float>(i + 1) * 0.13f);
+        x_f32[static_cast<size_t>(i)]   = 0.3f * std::cos(static_cast<float>(i + 1) * 0.17f);
+    }
+
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_K, K);
+    std::vector<uint8_t> row_q4k(row_bytes);
+    ggml_quantize_chunk(GGML_TYPE_Q4_K, row_f32.data(), row_q4k.data(), 0, 1, K, nullptr);
+
+    std::vector<uint8_t> w_q4k(row_bytes * static_cast<size_t>(M));
+    for (int64_t r = 0; r < M; ++r) {
+        std::memcpy(w_q4k.data() + static_cast<size_t>(r) * row_bytes, row_q4k.data(), row_bytes);
+    }
+
+    const double vk_ms = bench_q4k_matvec_ms(vk_backend, K, M, w_q4k, x_f32, kWarmup, kTimed);
+
+    double cpu_ms = -1.0;
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (cpu) {
+        ggml_backend_cpu_set_n_threads(cpu, threads);
+        cpu_ms = bench_q4k_matvec_ms(cpu, K, M, w_q4k, x_f32, kWarmup, kTimed);
+        ggml_backend_free(cpu);
+    }
+
+    bool use_igpu = false;
+    if (vk_ms > 0.0 && cpu_ms > 0.0) {
+        // Require iGPU to be at least 10% faster than multi-threaded CPU to justify shared-RAM copy & GPU dispatch
+        if (vk_ms < cpu_ms * 0.90) {
+            use_igpu = true;
+        } else {
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          "Vulkan iGPU ('%s') slower than %d-thread CPU in micro-benchmark "
+                          "(Vulkan %.2f ms vs CPU %.2f ms, %.2fx; pass --device gpu to force)",
+                          vk_desc.c_str(), threads, vk_ms, cpu_ms, cpu_ms / vk_ms);
+            reject_reason = buf;
+        }
+    } else if (vk_ms <= 0.0) {
+        reject_reason = "Vulkan iGPU micro-benchmark failed for '" + vk_desc + "'";
+    } else {
+        // CPU reference failed unexpectedly; allow Vulkan iGPU
+        use_igpu = true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        cache[key] = { use_igpu, reject_reason };
+    }
+    return use_igpu;
+}
+
 #endif // OPENGP_HAS_VULKAN
 
 } // namespace
 
-GpuBackendSelection select_gpu_backend(int gpu_device_id) {
+GpuBackendSelection select_gpu_backend(int gpu_device_id, int cpu_threads, bool allow_slow_igpu) {
+    (void)gpu_device_id;
+    (void)cpu_threads;
+    (void)allow_slow_igpu;
     GpuBackendSelection result;
 
     // 1. NVIDIA CUDA (highest priority — untouched workflow when present)
@@ -424,6 +598,17 @@ GpuBackendSelection select_gpu_backend(int gpu_device_id) {
         }
 
         const auto & chosen = candidates[chosen_idx];
+
+        // Auto-calibrate Vulkan iGPUs against CPU in AUTO mode so weak iGPUs don't regress performance
+        if (chosen.is_igpu && !allow_slow_igpu) {
+            std::string bench_err;
+            if (!vulkan_igpu_beats_cpu_cached(chosen_idx, chosen.desc, backend, cpu_threads, bench_err)) {
+                ggml_backend_free(backend);
+                result.fail_reason = bench_err;
+                return result;
+            }
+        }
+
         result.backend = backend;
         result.kind    = GpuBackendKind::VULKAN;
         result.is_igpu = chosen.is_igpu;

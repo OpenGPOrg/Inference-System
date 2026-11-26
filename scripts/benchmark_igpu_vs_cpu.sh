@@ -131,10 +131,10 @@ run_benchmark_mode() {
 # --- Optional Warm-up run for Vulkan Shader Cache ---
 echo ""
 echo "[*] Warming up Vulkan pipeline cache (1 quick pass)..."
-"$BINARY" --model "$MODEL_PATH" --prompt "Warmup" --max-tokens 4 --temp 0 >/dev/null 2>&1 || true
+"$BINARY" --model "$MODEL_PATH" --prompt "Warmup" --max-tokens 4 --temp 0 --device gpu --lm-head gpu >/dev/null 2>&1 || true
 
-# 1. Benchmark Vulkan iGPU (AUTO mode: Reasoning on Vulkan iGPU, LM Head on Vulkan)
-run_benchmark_mode "VULKAN_IGPU"
+# 1. Benchmark Vulkan iGPU (explicit --device gpu --lm-head gpu to bypass AUTO iGPU speed gate)
+run_benchmark_mode "VULKAN_IGPU" --device gpu --lm-head gpu
 
 # 2. Benchmark Multi-Threaded CPU
 CPU_FLAGS=(--device cpu --lm-head cpu)
