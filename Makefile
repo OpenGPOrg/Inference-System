@@ -11,7 +11,7 @@ build:
 	fi
 	cmake --build $(BUILD_DIR) -j$(NPROC)
 
-# Clean ONLY OpenGP compiled objects/libraries/binaries; preserve CMake build files & vendor GGML/CUDA
+# Clean ONLY OpenGP compiled objects/libraries/binaries; preserve CMake build files & vendor GGML/CUDA/Vulkan
 clean:
 	@for d in $(BUILD_DIR)/CMakeFiles/opengp_*.dir; do \
 		if [ -d "$$d" ]; then find "$$d" -name "*.o" -delete; fi; \
@@ -22,6 +22,6 @@ clean:
 	      $(BUILD_DIR)/opengp_reasoning \
 	      $(BUILD_DIR)/opengp_infer
 
-# Full wipe including compiled vendor GGML/CUDA libraries
+# Full wipe including compiled vendor GGML/CUDA/Vulkan libraries
 distclean:
 	rm -rf $(BUILD_DIR)

@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 
 option(OPENGP_CUDA  "Enable CUDA GPU backend if CUDA Toolkit is available" ON)
 option(OPENGP_METAL "Enable Apple Metal GPU backend on macOS" ON)
+set(OPENGP_VULKAN "AUTO" CACHE STRING "Vulkan GPU backend: AUTO (enabled when CUDA/Metal absent and Vulkan SDK + glslc found), ON, OFF")
+set_property(CACHE OPENGP_VULKAN PROPERTY STRINGS AUTO ON OFF)
 
 # GNU extensions are required for CPU affinity / NUMA on Linux
 add_definitions(-D_GNU_SOURCE)
@@ -143,9 +145,11 @@ if (OPENGP_CUDA AND CUDAToolkit_FOUND)
 
     target_link_libraries(ggml PUBLIC ggml-cuda)
     target_compile_definitions(ggml PUBLIC OPENGP_HAS_CUDA=1)
+    set(_OPENGP_CUDA_ENABLED TRUE)
 else()
-    message(STATUS "OpenGP: CUDA Toolkit not available or disabled — building CPU-only backend")
+    message(STATUS "OpenGP: CUDA Toolkit not available or disabled — ggml-cuda disabled")
     target_compile_definitions(ggml PUBLIC OPENGP_HAS_CUDA=0)
+    set(_OPENGP_CUDA_ENABLED FALSE)
 endif()
 
 # Optional Apple Metal Backend (auto-enabled on macOS with embedded .metal kernels)
@@ -249,6 +253,193 @@ if (APPLE AND OPENGP_METAL)
 
     target_link_libraries(ggml PUBLIC ggml-metal)
     target_compile_definitions(ggml PUBLIC OPENGP_HAS_METAL=1)
+    set(_OPENGP_METAL_ENABLED TRUE)
 else()
     target_compile_definitions(ggml PUBLIC OPENGP_HAS_METAL=0)
+    set(_OPENGP_METAL_ENABLED FALSE)
+endif()
+
+# Optional Vulkan Backend (AMD / Intel / integrated GPUs; strictly soft-fail, skipped in AUTO when CUDA/Metal enabled)
+string(TOUPPER "${OPENGP_VULKAN}" _OPENGP_VULKAN_MODE)
+set(_OPENGP_VULKAN_ENABLED FALSE)
+set(_OPENGP_VULKAN_TRY FALSE)
+set(_OPENGP_VULKAN_EXPLICIT FALSE)
+
+if (_OPENGP_VULKAN_MODE STREQUAL "OFF" OR _OPENGP_VULKAN_MODE STREQUAL "0" OR
+    _OPENGP_VULKAN_MODE STREQUAL "FALSE" OR _OPENGP_VULKAN_MODE STREQUAL "NO")
+    message(STATUS "OpenGP: Vulkan backend disabled (OPENGP_VULKAN=${OPENGP_VULKAN})")
+elseif (_OPENGP_VULKAN_MODE STREQUAL "AUTO")
+    if (APPLE)
+        message(STATUS "OpenGP: macOS detected — skipping ggml-vulkan in AUTO mode (Apple Metal preferred)")
+    elseif (_OPENGP_CUDA_ENABLED)
+        message(STATUS "OpenGP: CUDA enabled — skipping ggml-vulkan in AUTO mode (pass -DOPENGP_VULKAN=ON to build both)")
+    else()
+        set(_OPENGP_VULKAN_TRY TRUE)
+    endif()
+elseif (_OPENGP_VULKAN_MODE STREQUAL "ON" OR _OPENGP_VULKAN_MODE STREQUAL "1" OR
+        _OPENGP_VULKAN_MODE STREQUAL "TRUE" OR _OPENGP_VULKAN_MODE STREQUAL "YES")
+    set(_OPENGP_VULKAN_TRY TRUE)
+    set(_OPENGP_VULKAN_EXPLICIT TRUE)
+else()
+    message(WARNING "OpenGP: Unrecognized OPENGP_VULKAN='${OPENGP_VULKAN}' (expected AUTO, ON, or OFF) — disabling ggml-vulkan")
+endif()
+
+function(_opengp_vk_skip MSG)
+    if (_OPENGP_VULKAN_EXPLICIT)
+        message(WARNING "OpenGP: ${MSG} — continuing without ggml-vulkan")
+    else()
+        message(STATUS "OpenGP: ${MSG} — ggml-vulkan disabled")
+    endif()
+endfunction()
+
+function(_opengp_vk_test_shader_ext GLSLC_BIN EXT_NAME TEST_FILE RESULT_VAR OUT_DEFS_VAR)
+    execute_process(
+        COMMAND "${GLSLC_BIN}" -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_FILE}"
+        OUTPUT_QUIET
+        ERROR_VARIABLE _glslc_err
+        RESULT_VARIABLE _glslc_rc
+    )
+    if (_glslc_rc EQUAL 0 AND NOT _glslc_err MATCHES "extension not supported: ${EXT_NAME}")
+        message(STATUS "OpenGP Vulkan: ${EXT_NAME} supported by glslc")
+        set(_defs "${${OUT_DEFS_VAR}}")
+        list(APPEND _defs "${RESULT_VAR}")
+        set(${OUT_DEFS_VAR} "${_defs}" PARENT_SCOPE)
+    else()
+        message(STATUS "OpenGP Vulkan: ${EXT_NAME} not supported by glslc")
+    endif()
+endfunction()
+
+if (_OPENGP_VULKAN_TRY)
+    find_package(Vulkan QUIET)
+    if (NOT Vulkan_FOUND)
+        _opengp_vk_skip("Vulkan SDK/loader not found")
+    else()
+        # Locate glslc shader compiler (honor explicit -DGLSLC=... override if provided)
+        if (DEFINED GLSLC)
+            set(_OPENGP_GLSLC "${GLSLC}")
+        elseif (Vulkan_GLSLC_EXECUTABLE AND EXISTS "${Vulkan_GLSLC_EXECUTABLE}")
+            set(_OPENGP_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")
+        else()
+            find_program(_OPENGP_GLSLC_FOUND NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin")
+            set(_OPENGP_GLSLC "${_OPENGP_GLSLC_FOUND}")
+        endif()
+
+        # Verify glslc exists and is runnable
+        set(_OPENGP_GLSLC_OK FALSE)
+        if (_OPENGP_GLSLC AND EXISTS "${_OPENGP_GLSLC}")
+            execute_process(
+                COMMAND "${_OPENGP_GLSLC}" --version
+                OUTPUT_QUIET
+                ERROR_QUIET
+                RESULT_VARIABLE _glslc_ver_rc
+            )
+            if (_glslc_ver_rc EQUAL 0)
+                set(_OPENGP_GLSLC_OK TRUE)
+            endif()
+        endif()
+
+        # Verify Vulkan-Hpp C++ header (vulkan/vulkan.hpp) is available
+        find_path(_OPENGP_VULKAN_HPP_DIR
+            NAMES vulkan/vulkan.hpp
+            HINTS ${Vulkan_INCLUDE_DIRS} "$ENV{VULKAN_SDK}/include"
+        )
+
+        if (NOT _OPENGP_GLSLC_OK)
+            _opengp_vk_skip("glslc shader compiler not found or not runnable ('${_OPENGP_GLSLC}')")
+        elseif (NOT _OPENGP_VULKAN_HPP_DIR)
+            _opengp_vk_skip("vulkan/vulkan.hpp C++ header not found")
+        else()
+            set(_OPENGP_VULKAN_ENABLED TRUE)
+        endif()
+    endif()
+endif()
+
+if (_OPENGP_VULKAN_ENABLED)
+    message(STATUS "OpenGP: Vulkan ${Vulkan_VERSION} + glslc (${_OPENGP_GLSLC}) found — enabling ggml-vulkan backend")
+
+    set(VK_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-vulkan")
+    set(VK_SHADER_DIR  "${VK_DIR}/vulkan-shaders")
+    set(VK_GEN_DIR     "${CMAKE_CURRENT_BINARY_DIR}/vulkan_autogenerated")
+    set(VK_SPV_DIR     "${VK_GEN_DIR}/spv")
+    file(MAKE_DIRECTORY "${VK_SPV_DIR}")
+
+    set(VK_FEATURE_DEFS "")
+    _opengp_vk_test_shader_ext("${_OPENGP_GLSLC}" "GL_KHR_cooperative_matrix"              "${VK_SHADER_DIR}/feature-tests/coopmat.comp"              "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"              VK_FEATURE_DEFS)
+    _opengp_vk_test_shader_ext("${_OPENGP_GLSLC}" "GL_NV_cooperative_matrix2"              "${VK_SHADER_DIR}/feature-tests/coopmat2.comp"             "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"             VK_FEATURE_DEFS)
+    _opengp_vk_test_shader_ext("${_OPENGP_GLSLC}" "GL_NV_cooperative_matrix_decode_vector" "${VK_SHADER_DIR}/feature-tests/coopmat2_decode_vector.comp" "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT" VK_FEATURE_DEFS)
+    _opengp_vk_test_shader_ext("${_OPENGP_GLSLC}" "GL_EXT_integer_dot_product"             "${VK_SHADER_DIR}/feature-tests/integer_dot.comp"          "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"          VK_FEATURE_DEFS)
+    _opengp_vk_test_shader_ext("${_OPENGP_GLSLC}" "GL_EXT_bfloat16"                        "${VK_SHADER_DIR}/feature-tests/bfloat16.comp"             "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"             VK_FEATURE_DEFS)
+    _opengp_vk_test_shader_ext("${_OPENGP_GLSLC}" "GL_EXT_float_e2m1"                      "${VK_SHADER_DIR}/feature-tests/float_e2m1.comp"           "GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT"           VK_FEATURE_DEFS)
+    _opengp_vk_test_shader_ext("${_OPENGP_GLSLC}" "GL_EXT_float_e4m3"                      "${VK_SHADER_DIR}/feature-tests/float_e4m3.comp"           "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT"           VK_FEATURE_DEFS)
+
+    # Host tool that invokes glslc and embeds compiled SPIR-V shaders into C++ translation units
+    add_executable(opengp-vulkan-shaders-gen
+        "${VK_SHADER_DIR}/vulkan-shaders-gen.cpp"
+    )
+    target_compile_features(opengp-vulkan-shaders-gen PRIVATE cxx_std_17)
+    target_link_libraries(opengp-vulkan-shaders-gen PRIVATE Threads::Threads)
+    target_compile_definitions(opengp-vulkan-shaders-gen PRIVATE ${VK_FEATURE_DEFS})
+
+    file(GLOB _VK_SHADER_COMP_FILES CONFIGURE_DEPENDS "${VK_SHADER_DIR}/*.comp")
+    file(GLOB _VK_SHADER_GLSL_HEADERS CONFIGURE_DEPENDS "${VK_SHADER_DIR}/*.glsl")
+
+    set(_VK_GEN_HPP "${VK_GEN_DIR}/ggml-vulkan-shaders.hpp")
+    add_custom_command(
+        OUTPUT "${_VK_GEN_HPP}"
+        COMMAND opengp-vulkan-shaders-gen
+            --output-dir "${VK_SPV_DIR}"
+            --target-hpp "${_VK_GEN_HPP}"
+        DEPENDS opengp-vulkan-shaders-gen
+        COMMENT "Generating Vulkan shaders header"
+        VERBATIM
+    )
+
+    set(_VK_GEN_CPP_FILES "")
+    foreach (_shader_full ${_VK_SHADER_COMP_FILES})
+        get_filename_component(_shader_name "${_shader_full}" NAME)
+        set(_shader_cpp "${VK_GEN_DIR}/${_shader_name}.cpp")
+        add_custom_command(
+            OUTPUT "${_shader_cpp}"
+            COMMAND opengp-vulkan-shaders-gen
+                --glslc      "${_OPENGP_GLSLC}"
+                --source     "${_shader_full}"
+                --output-dir "${VK_SPV_DIR}"
+                --target-hpp "${_VK_GEN_HPP}"
+                --target-cpp "${_shader_cpp}"
+            DEPENDS opengp-vulkan-shaders-gen "${_VK_GEN_HPP}" "${_shader_full}" ${_VK_SHADER_GLSL_HEADERS}
+            COMMENT "Compiling Vulkan shaders for ${_shader_name}"
+            VERBATIM
+        )
+        list(APPEND _VK_GEN_CPP_FILES "${_shader_cpp}")
+    endforeach()
+
+    add_library(ggml-vulkan STATIC
+        "${VK_DIR}/ggml-vulkan.cpp"
+        "${VK_DIR}/ggml-vulkan-buffers.cpp"
+        "${VK_DIR}/ggml-vulkan-comm.cpp"
+        "${VK_DIR}/ggml-vulkan-debug.cpp"
+        "${_VK_GEN_HPP}"
+        ${_VK_GEN_CPP_FILES}
+    )
+
+    target_include_directories(ggml-vulkan PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${VK_DIR}"
+        "${VK_GEN_DIR}"
+        "${VK_DIR}/third_party/spirv-headers/include"
+        "${_OPENGP_VULKAN_HPP_DIR}"
+    )
+
+    target_compile_definitions(ggml-vulkan PRIVATE ${VK_FEATURE_DEFS})
+    target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+
+    target_link_libraries(ggml PUBLIC ggml-vulkan)
+    target_compile_definitions(ggml PUBLIC OPENGP_HAS_VULKAN=1)
+else()
+    target_compile_definitions(ggml PUBLIC OPENGP_HAS_VULKAN=0)
+endif()
+
+if (NOT _OPENGP_CUDA_ENABLED AND NOT _OPENGP_METAL_ENABLED AND NOT _OPENGP_VULKAN_ENABLED)
+    message(STATUS "OpenGP: No GPU backend enabled — building CPU-only backend")
 endif()
