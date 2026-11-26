@@ -14,25 +14,45 @@ struct gguf_context;
 namespace opengp {
 namespace reasoner {
 
-// Tensor descriptors for a single Transformer block (blk.<l>.*)
+enum class LayerKind {
+    STANDARD_ATTENTION,
+    GATED_ATTENTION,
+    GATED_DELTANET_SSM
+};
+
+// Tensor descriptors for a single Transformer / Hybrid SSM block (blk.<l>.*)
 struct LayerWeights {
-    struct ggml_tensor * attn_norm   = nullptr; // blk.l.attn_norm.weight
+    LayerKind kind = LayerKind::STANDARD_ATTENTION;
+
+    // Shared layer norms & SwiGLU FFN weights
+    struct ggml_tensor * attn_norm = nullptr; // blk.l.attn_norm.weight
+    struct ggml_tensor * ffn_norm  = nullptr; // blk.l.ffn_norm.weight (or post_attention_norm.weight)
+    struct ggml_tensor * w_gate    = nullptr; // blk.l.ffn_gate.weight
+    struct ggml_tensor * w_up      = nullptr; // blk.l.ffn_up.weight
+    struct ggml_tensor * w_down    = nullptr; // blk.l.ffn_down.weight
+
+    // Standard / Gated Attention weights
     struct ggml_tensor * wq          = nullptr; // blk.l.attn_q.weight
     struct ggml_tensor * wk          = nullptr; // blk.l.attn_k.weight
     struct ggml_tensor * wv          = nullptr; // blk.l.attn_v.weight
     struct ggml_tensor * wo          = nullptr; // blk.l.attn_output.weight
-    struct ggml_tensor * ffn_norm    = nullptr; // blk.l.ffn_norm.weight
-    struct ggml_tensor * w_gate      = nullptr; // blk.l.ffn_gate.weight
-    struct ggml_tensor * w_up        = nullptr; // blk.l.ffn_up.weight
-    struct ggml_tensor * w_down      = nullptr; // blk.l.ffn_down.weight
-
-    // Optional tensors (auto-detected per layer)
-    struct ggml_tensor * attn_q_norm = nullptr; // blk.l.attn_q_norm.weight (e.g. Qwen3)
-    struct ggml_tensor * attn_k_norm = nullptr; // blk.l.attn_k_norm.weight (e.g. Qwen3)
+    struct ggml_tensor * attn_q_norm = nullptr; // blk.l.attn_q_norm.weight
+    struct ggml_tensor * attn_k_norm = nullptr; // blk.l.attn_k_norm.weight
     struct ggml_tensor * bq          = nullptr; // blk.l.attn_q.bias
     struct ggml_tensor * bk          = nullptr; // blk.l.attn_k.bias
     struct ggml_tensor * bv          = nullptr; // blk.l.attn_v.bias
     struct ggml_tensor * bo          = nullptr; // blk.l.attn_output.bias
+
+    // Gated DeltaNet SSM weights (used when kind == GATED_DELTANET_SSM)
+    struct ggml_tensor * attn_qkv    = nullptr; // blk.l.attn_qkv.weight
+    struct ggml_tensor * attn_gate   = nullptr; // blk.l.attn_gate.weight
+    struct ggml_tensor * ssm_conv1d  = nullptr; // blk.l.ssm_conv1d.weight
+    struct ggml_tensor * ssm_alpha   = nullptr; // blk.l.ssm_alpha.weight
+    struct ggml_tensor * ssm_beta    = nullptr; // blk.l.ssm_beta.weight
+    struct ggml_tensor * ssm_a       = nullptr; // blk.l.ssm_a
+    struct ggml_tensor * ssm_dt_bias = nullptr; // blk.l.ssm_dt.bias
+    struct ggml_tensor * ssm_norm    = nullptr; // blk.l.ssm_norm.weight
+    struct ggml_tensor * ssm_out     = nullptr; // blk.l.ssm_out.weight
 
     size_t total_bytes     = 0;
     bool   is_gpu_resident = false;
@@ -47,6 +67,11 @@ public:
     WeightStore(const WeightStore &) = delete;
     WeightStore & operator=(const WeightStore &) = delete;
 
+    // Lightweight metadata-only scan of owned layers [range.start .. range.end)
+    static std::vector<LayerKind> detect_layer_kinds(const struct gguf_context * gctx,
+                                                     const ModelConfig &         config,
+                                                     const LayerRange &          range);
+
     // Memory-map GGUF tensor blob, index owned [range.start .. range.end) blk.* weights & optional globals
     bool init(const std::string &   gguf_filepath,
               struct gguf_context * gctx,
@@ -59,6 +84,8 @@ public:
     // Returns layer weights ready for compute on `backend` (local_layer_idx in [0 .. get_n_local_layers() - 1])
     const LayerWeights & prepare_layer(int local_layer_idx);
     void release() { cleanup(); }
+
+    std::vector<LayerKind> get_layer_kinds() const;
 
     const struct ggml_tensor * get_output_norm() const { return output_norm_; }
     const struct ggml_tensor * get_rope_freqs() const { return rope_freqs_; }

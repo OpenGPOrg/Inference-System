@@ -47,7 +47,7 @@ bool arch_uses_neox_rope(const std::string & arch) {
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
-    return lower == "qwen2" || lower == "qwen3" || lower == "qwen3moe" ||
+    return lower == "qwen2" || lower == "qwen3" || lower == "qwen3moe" || lower == "qwen35" ||
            lower == "gemma" || lower == "gemma2" || lower == "gemma3" ||
            lower == "phi3"  || lower == "falcon" || lower == "starcoder2" ||
            lower == "olmo2" || lower == "internlm2";
@@ -85,6 +85,26 @@ bool ModelConfig::load_from_gguf(const struct gguf_context * gctx, const Reasoni
     rope_dim       = read_gguf_int(gctx, arch + ".rope.dimension_count", d_head_k);
     rope_freq_base = read_gguf_float(gctx, arch + ".rope.freq_base", 10000.0f);
 
+    // Optional Hybrid SSM / Gated DeltaNet fields
+    ssm_conv_kernel         = read_gguf_int(gctx, arch + ".ssm.conv_kernel", 0);
+    ssm_state_size          = read_gguf_int(gctx, arch + ".ssm.state_size", 0);
+    ssm_group_count         = read_gguf_int(gctx, arch + ".ssm.group_count", 0);
+    ssm_time_step_rank      = read_gguf_int(gctx, arch + ".ssm.time_step_rank", 0);
+    ssm_inner_size          = read_gguf_int(gctx, arch + ".ssm.inner_size", 0);
+    full_attention_interval = read_gguf_int(gctx, arch + ".full_attention_interval", 0);
+    nextn_predict_layers    = read_gguf_int(gctx, arch + ".nextn_predict_layers", 0);
+
+    // Exclude trailing MTP (multi-token prediction) blocks if missing standard layer weights
+    while (nextn_predict_layers > 0 && n_layers > 1) {
+        std::string last_norm = "blk." + std::to_string(n_layers - 1) + ".attn_norm.weight";
+        if (gguf_find_tensor(gctx, last_norm.c_str()) < 0) {
+            n_layers--;
+            nextn_predict_layers--;
+        } else {
+            break;
+        }
+    }
+
     if (opts.rope_type == RopeTypeOverride::NEOX) {
         rope_mode = kRopeTypeNeox;
     } else if (opts.rope_type == RopeTypeOverride::NORM) {
@@ -104,6 +124,11 @@ void ModelConfig::print_summary() const {
                 attn_type, n_heads, n_kv_heads, d_head_k, d_head_v, rms_norm_eps);
     std::printf("[ModelConfig] RoPE: dim=%d, freq_base=%.1f, mode=%s | GGUF train_ctx=%d (uncapped)\n",
                 rope_dim, rope_freq_base, (rope_mode == kRopeTypeNeox ? "NEOX" : "NORM"), context_length);
+    if (is_hybrid_ssm()) {
+        std::printf("[ModelConfig] SSM : DeltaNet (conv=%d, d_state=%d, groups=%d, dt_rank=%d, inner=%d, attn_interval=%d)\n",
+                    ssm_conv_kernel, ssm_state_size, ssm_group_count,
+                    ssm_time_step_rank, ssm_inner_size, full_attention_interval);
+    }
 }
 
 } // namespace reasoner

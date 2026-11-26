@@ -209,15 +209,22 @@ int main(int argc, char ** argv) {
                   << std::fixed << std::setprecision(1) << (ws.get_total_weight_bytes() / (1024.0 * 1024.0))
                   << " MB)\n";
     }
-    const auto & init_kv = engine.get_kv_cache();
+    const auto & init_kv  = engine.get_kv_cache();
+    const auto & init_ssm = engine.get_recurrent_cache();
     const char * kv_mem_label = !engine.is_gpu_active()
         ? "Host RAM"
         : (engine.is_igpu_active() ? "GPU Shared Memory" : "GPU VRAM");
     std::cout << "[KV Cache] Memory       : " << kv_mem_label
               << " | allocated=" << std::setprecision(2) << (init_kv.total_bytes() / (1024.0 * 1024.0))
               << " MB (ctx=" << init_kv.get_capacity() << " tokens, "
+              << init_kv.get_n_attn_layers() << " attn layers, "
               << std::setprecision(1) << (init_kv.bytes_per_token() / 1024.0) << " KB/tok, "
               << ggml_type_name(init_kv.get_dtype()) << ")\n";
+    if (init_ssm.get_n_ssm_layers() > 0) {
+        std::cout << "[SSM State] Memory      : " << kv_mem_label
+                  << " | allocated=" << std::setprecision(2) << (init_ssm.total_bytes() / (1024.0 * 1024.0))
+                  << " MB (" << init_ssm.get_n_ssm_layers() << " SSM layers, fixed O(1))\n";
+    }
 
     // Run Prefill forward pass
     ReasoningOutput r_out;

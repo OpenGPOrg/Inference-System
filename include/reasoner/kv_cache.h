@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "reasoner/model_config.h"
+#include "reasoner/weight_store.h"
 
 #include <cstddef>
 #include <vector>
@@ -10,7 +11,7 @@
 namespace opengp {
 namespace reasoner {
 
-// Dynamically growable per-layer KV Cache allocated on the active compute backend
+// Fixed-capacity sparse KV Cache (allocates tensors ONLY for Attention layers)
 class KVCache {
 public:
     KVCache();
@@ -19,12 +20,12 @@ public:
     KVCache(const KVCache &) = delete;
     KVCache & operator=(const KVCache &) = delete;
 
-    bool init(const ModelConfig & config,
-              int                 n_local_layers,
-              ggml_backend_t      backend,
-              KVPrecision         precision);
+    bool init(const ModelConfig &            config,
+              const std::vector<LayerKind> & layer_kinds,
+              ggml_backend_t                 backend,
+              KVPrecision                    precision);
 
-    // Pre-allocates fixed KV cache capacity [d_head * n_kv_heads, capacity] per owned layer
+    // Pre-allocates fixed KV cache capacity [d_head * n_kv_heads, capacity] for each Attention layer
     bool allocate(size_t capacity);
 
     // Graph views for writing current token slice [n_past .. n_past + n_tokens - 1]
@@ -40,6 +41,7 @@ public:
     void release() { cleanup(); }
 
     int    get_n_local_layers() const { return n_local_layers_; }
+    int    get_n_attn_layers() const { return n_attn_layers_; }
     size_t get_n_past() const { return n_past_; }
     size_t get_capacity() const { return capacity_; }
     size_t total_bytes() const;
@@ -49,10 +51,12 @@ public:
 private:
     void cleanup();
 
-    ModelConfig    config_;
-    int            n_local_layers_ = 0;
-    ggml_backend_t backend_        = nullptr;
-    enum ggml_type dtype_          = GGML_TYPE_F16;
+    ModelConfig            config_;
+    std::vector<LayerKind> layer_kinds_;
+    int                    n_local_layers_ = 0;
+    int                    n_attn_layers_  = 0;
+    ggml_backend_t         backend_        = nullptr;
+    enum ggml_type         dtype_          = GGML_TYPE_F16;
 
     size_t n_past_   = 0;
     size_t capacity_ = 0;
@@ -60,8 +64,8 @@ private:
     struct ggml_context * ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;
 
-    std::vector<struct ggml_tensor *> k_layers_; // [d_head_k * n_kv_heads, capacity]
-    std::vector<struct ggml_tensor *> v_layers_; // [d_head_v * n_kv_heads, capacity]
+    std::vector<struct ggml_tensor *> k_layers_; // [d_head_k * n_kv_heads, capacity] or nullptr for SSM layers
+    std::vector<struct ggml_tensor *> v_layers_; // [d_head_v * n_kv_heads, capacity] or nullptr for SSM layers
 };
 
 } // namespace reasoner

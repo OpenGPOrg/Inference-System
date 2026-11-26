@@ -39,6 +39,7 @@ void ReasoningEngine::cleanup() {
         gallocr_ = nullptr;
     }
     // Release backend-owned buffers before freeing the backend itself
+    recurrent_cache_.release();
     kv_cache_.release();
     weights_.release();
     if (backend_) {
@@ -52,6 +53,7 @@ void ReasoningEngine::cleanup() {
     backend_kind_          = GpuBackendKind::NONE;
     is_gpu_                = false;
     is_igpu_               = false;
+    all_standard_attn_     = true;
     vulkan_use_flash_attn_ = false;
     vulkan_use_swiglu_     = false;
     is_initialized_        = false;
@@ -145,10 +147,10 @@ bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
 
         const int max_probe_tokens = (active_ctx_size_ >= 2) ? 2 : 1;
 
-        // Probe optional Vulkan fused optimizations (FlashAttention + SwiGLU) on layer 0
+        // Probe optional Vulkan fused optimizations (FlashAttention + SwiGLU) on layer 0 (standard Attention models)
         vulkan_use_flash_attn_ = false;
         vulkan_use_swiglu_     = false;
-        if (layer_range_.count() > 0 && weights_.get_n_resident_layers() > 0) {
+        if (all_standard_attn_ && layer_range_.count() > 0 && weights_.get_n_resident_layers() > 0) {
             const LayerWeights & lw0 = weights_.prepare_layer(0);
             std::vector<const LayerWeights *> probe_layers = { &lw0 };
 
@@ -183,14 +185,14 @@ bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
         for (int local_l : layers_to_check) {
             const LayerWeights & lw = weights_.prepare_layer(local_l);
             for (int n_tok = 1; n_tok <= max_probe_tokens; ++n_tok) {
-                const size_t ctx_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead();
+                const size_t ctx_bytes = ggml_tensor_overhead() * 256 + ggml_graph_overhead();
                 struct ggml_context * gctx = ggml_init({ ctx_bytes, nullptr, true });
                 if (!gctx) {
                     unsupported_desc = "preflight ggml_init failed";
                     return false;
                 }
                 LayerGraphIO io = build_layer_graph(
-                    gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, local_l, n_tok, 0);
+                    gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, &recurrent_cache_, local_l, n_tok, 0);
                 const bool ok = check_graph(io.graph, "layer graph");
                 ggml_free(gctx);
                 if (!ok) return false;
@@ -272,7 +274,18 @@ bool ReasoningEngine::initialize_impl(const std::string &      gguf_filepath,
     };
 
     try {
-        if (!kv_cache_.init(config_, layer_range_.count(), backend_, options_.kv_precision)) {
+        const std::vector<LayerKind> layer_kinds = WeightStore::detect_layer_kinds(gctx_, config_, layer_range_);
+        all_standard_attn_ = std::all_of(layer_kinds.begin(), layer_kinds.end(), [](LayerKind k) {
+            return k == LayerKind::STANDARD_ATTENTION;
+        });
+
+        // 1. Fixed O(1) recurrent states for SSM layers (no-op if pure Attention)
+        if (!recurrent_cache_.init(config_, layer_kinds, backend_)) {
+            return fallback_to_cpu("Vulkan recurrent cache init failed");
+        }
+
+        // 2. Sparse KV cache for Attention layers only
+        if (!kv_cache_.init(config_, layer_kinds, backend_, options_.kv_precision)) {
             return fallback_to_cpu("Vulkan KV cache init failed");
         }
 
@@ -338,8 +351,9 @@ bool ReasoningEngine::initialize_impl(const std::string &      gguf_filepath,
 
             size_t usable_vram = static_cast<size_t>(static_cast<double>(free_vram) * util);
             if (is_vulkan_igpu) {
-                size_t remaining_cap = (igpu_total_budget > kv_cache_.total_bytes())
-                                           ? (igpu_total_budget - kv_cache_.total_bytes())
+                const size_t state_bytes = kv_cache_.total_bytes() + recurrent_cache_.total_bytes();
+                size_t remaining_cap = (igpu_total_budget > state_bytes)
+                                           ? (igpu_total_budget - state_bytes)
                                            : 0;
                 usable_vram = std::min(usable_vram, remaining_cap);
             }
@@ -380,6 +394,7 @@ bool ReasoningEngine::initialize_impl(const std::string &      gguf_filepath,
 
 void ReasoningEngine::reset_kv_cache() {
     kv_cache_.reset();
+    recurrent_cache_.reset();
 }
 
 bool ReasoningEngine::forward_layer(int             local_layer_idx,
@@ -395,12 +410,12 @@ bool ReasoningEngine::forward_layer(int             local_layer_idx,
     }
 
     const LayerWeights & lw = weights_.prepare_layer(local_layer_idx);
-    const size_t layer_ctx_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead();
+    const size_t layer_ctx_bytes = ggml_tensor_overhead() * 256 + ggml_graph_overhead();
     struct ggml_context * gctx = ggml_init({ layer_ctx_bytes, nullptr, true });
     if (!gctx) return false;
 
     LayerGraphIO io = build_layer_graph(
-        gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, local_layer_idx,
+        gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, &recurrent_cache_, local_layer_idx,
         static_cast<int>(n_tokens), static_cast<int>(n_past));
 
     if (!ggml_gallocr_alloc_graph(gallocr_, io.graph)) {
@@ -415,9 +430,13 @@ bool ReasoningEngine::forward_layer(int             local_layer_idx,
     const size_t n_total = n_past + n_tokens;
 
     try {
-        ggml_backend_tensor_set(io.H_in,    H_in,    0, n_tokens * d_model * sizeof(float));
-        ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
-        ggml_backend_tensor_set(io.kq_mask, kq_mask, 0, n_total * n_tokens * sizeof(float));
+        ggml_backend_tensor_set(io.H_in, H_in, 0, n_tokens * d_model * sizeof(float));
+        if (io.pos_ids) {
+            ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
+        }
+        if (io.kq_mask) {
+            ggml_backend_tensor_set(io.kq_mask, kq_mask, 0, n_total * n_tokens * sizeof(float));
+        }
 
         if (ggml_backend_graph_compute(backend_, io.graph) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "[-] ReasoningEngine: Graph execution failed at local layer %d (global %d)\n",
@@ -548,8 +567,10 @@ bool ReasoningEngine::forward(const float *     H_0,
 
     // Vulkan-only fast path: fuse all consecutive GPU-resident layers (+ final norm if all resident)
     // into a single graph submission to eliminate per-layer fence waits and CPU<->GPU round-trips.
-    // CUDA, Metal, and CPU workflows are completely untouched below.
-    const int n_vulkan_fused = (backend_kind_ == GpuBackendKind::VULKAN) ? weights_.get_n_resident_layers() : 0;
+    // Hybrid SSM / Gated Attention models, CUDA, Metal, and CPU workflows use forward_layer() below.
+    const int n_vulkan_fused = (backend_kind_ == GpuBackendKind::VULKAN && all_standard_attn_)
+                                   ? weights_.get_n_resident_layers()
+                                   : 0;
     if (n_vulkan_fused > 0 && n_vulkan_fused == n_local) {
         std::vector<float> kq_mask;
         if (n_tokens > 1) {

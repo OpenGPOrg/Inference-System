@@ -19,43 +19,72 @@ size_t pad_up(size_t val, size_t align) {
     return ((val + align - 1) / align) * align;
 }
 
-// Uniform tensor visitor for LayerWeights (avoids duplicating code across inspection, resident, and staging copies)
+// Uniform tensor visitor supporting Standard Attention, Gated Attention, and Gated DeltaNet SSM layers
 template <typename Fn>
-void visit_layer_tensors(LayerWeights & w, Fn && fn) {
+void visit_layer_tensors_impl(const LayerWeights & w, Fn && fn) {
+    const bool is_ssm = (w.kind == LayerKind::GATED_DELTANET_SSM);
+
+    // Core shared norm + SwiGLU FFN tensors
     fn("attn_norm",   w.attn_norm,   true);
-    fn("wq",          w.wq,          true);
-    fn("wk",          w.wk,          true);
-    fn("wv",          w.wv,          true);
-    fn("wo",          w.wo,          true);
     fn("ffn_norm",    w.ffn_norm,    true);
     fn("w_gate",      w.w_gate,      true);
     fn("w_up",        w.w_up,        true);
     fn("w_down",      w.w_down,      true);
+
+    // Attention tensors (required when not SSM)
+    fn("wq",          w.wq,          !is_ssm);
+    fn("wk",          w.wk,          !is_ssm);
+    fn("wv",          w.wv,          !is_ssm);
+    fn("wo",          w.wo,          !is_ssm);
     fn("attn_q_norm", w.attn_q_norm, false);
     fn("attn_k_norm", w.attn_k_norm, false);
     fn("bq",          w.bq,          false);
     fn("bk",          w.bk,          false);
     fn("bv",          w.bv,          false);
     fn("bo",          w.bo,          false);
+
+    // Gated DeltaNet SSM tensors (required when SSM)
+    fn("attn_qkv",    w.attn_qkv,    is_ssm);
+    fn("attn_gate",   w.attn_gate,   is_ssm);
+    fn("ssm_conv1d",  w.ssm_conv1d,  is_ssm);
+    fn("ssm_alpha",   w.ssm_alpha,   is_ssm);
+    fn("ssm_beta",    w.ssm_beta,    is_ssm);
+    fn("ssm_a",       w.ssm_a,       is_ssm);
+    fn("ssm_dt_bias", w.ssm_dt_bias, is_ssm);
+    fn("ssm_norm",    w.ssm_norm,    is_ssm);
+    fn("ssm_out",     w.ssm_out,     is_ssm);
 }
 
-template <typename Fn>
-void visit_layer_tensors_const(const LayerWeights & w, Fn && fn) {
-    fn("attn_norm",   w.attn_norm,   true);
-    fn("wq",          w.wq,          true);
-    fn("wk",          w.wk,          true);
-    fn("wv",          w.wv,          true);
-    fn("wo",          w.wo,          true);
-    fn("ffn_norm",    w.ffn_norm,    true);
-    fn("w_gate",      w.w_gate,      true);
-    fn("w_up",        w.w_up,        true);
-    fn("w_down",      w.w_down,      true);
-    fn("attn_q_norm", w.attn_q_norm, false);
-    fn("attn_k_norm", w.attn_k_norm, false);
-    fn("bq",          w.bq,          false);
-    fn("bk",          w.bk,          false);
-    fn("bv",          w.bv,          false);
-    fn("bo",          w.bo,          false);
+// Uniform pair-wise tensor mapping for cloning or staging a LayerWeights struct
+template <typename CopyFn>
+void transform_layer_tensors(const LayerWeights & src, LayerWeights & dst, CopyFn && copy_fn) {
+    dst.kind        = src.kind;
+    dst.total_bytes = src.total_bytes;
+
+    copy_fn(dst.attn_norm,   src.attn_norm);
+    copy_fn(dst.ffn_norm,    src.ffn_norm);
+    copy_fn(dst.w_gate,      src.w_gate);
+    copy_fn(dst.w_up,        src.w_up);
+    copy_fn(dst.w_down,      src.w_down);
+    copy_fn(dst.wq,          src.wq);
+    copy_fn(dst.wk,          src.wk);
+    copy_fn(dst.wv,          src.wv);
+    copy_fn(dst.wo,          src.wo);
+    copy_fn(dst.attn_q_norm, src.attn_q_norm);
+    copy_fn(dst.attn_k_norm, src.attn_k_norm);
+    copy_fn(dst.bq,          src.bq);
+    copy_fn(dst.bk,          src.bk);
+    copy_fn(dst.bv,          src.bv);
+    copy_fn(dst.bo,          src.bo);
+    copy_fn(dst.attn_qkv,    src.attn_qkv);
+    copy_fn(dst.attn_gate,   src.attn_gate);
+    copy_fn(dst.ssm_conv1d,  src.ssm_conv1d);
+    copy_fn(dst.ssm_alpha,   src.ssm_alpha);
+    copy_fn(dst.ssm_beta,    src.ssm_beta);
+    copy_fn(dst.ssm_a,       src.ssm_a);
+    copy_fn(dst.ssm_dt_bias, src.ssm_dt_bias);
+    copy_fn(dst.ssm_norm,    src.ssm_norm);
+    copy_fn(dst.ssm_out,     src.ssm_out);
 }
 
 struct ggml_tensor * clone_tensor_meta(struct ggml_context * ctx, const struct ggml_tensor * src) {
@@ -111,17 +140,53 @@ void WeightStore::cleanup() {
         close(fd_);
         fd_ = -1;
     }
-    host_output_norm_ = nullptr;
-    host_rope_freqs_  = nullptr;
-    host_lm_head_     = nullptr;
-    output_norm_      = nullptr;
-    rope_freqs_       = nullptr;
-    lm_head_          = nullptr;
+    host_output_norm_  = nullptr;
+    host_rope_freqs_   = nullptr;
+    host_lm_head_      = nullptr;
+    output_norm_       = nullptr;
+    rope_freqs_        = nullptr;
+    lm_head_           = nullptr;
     n_local_layers_    = 0;
     n_resident_layers_ = 0;
     n_streamed_layers_ = 0;
     host_layers_.clear();
     active_layers_.clear();
+}
+
+std::vector<LayerKind> WeightStore::detect_layer_kinds(const struct gguf_context * gctx,
+                                                         const ModelConfig &         config,
+                                                         const LayerRange &          range) {
+    const int n_local = range.count();
+    std::vector<LayerKind> kinds(n_local, LayerKind::STANDARD_ATTENTION);
+    if (!gctx || n_local <= 0) return kinds;
+
+    const int64_t expected_q_dim = static_cast<int64_t>(config.n_heads) * config.d_head_k;
+    for (int local_l = 0; local_l < n_local; ++local_l) {
+        const int global_l = range.start + local_l;
+        const std::string prefix = "blk." + std::to_string(global_l) + ".";
+
+        if (gguf_find_tensor(gctx, (prefix + "ssm_out.weight").c_str()) >= 0) {
+            kinds[local_l] = LayerKind::GATED_DELTANET_SSM;
+        } else {
+            int64_t q_idx = gguf_find_tensor(gctx, (prefix + "attn_q.weight").c_str());
+            if (q_idx >= 0) {
+                const int64_t * ne = gguf_get_tensor_ne(gctx, q_idx);
+                if (ne[1] == expected_q_dim * 2) {
+                    kinds[local_l] = LayerKind::GATED_ATTENTION;
+                }
+            }
+        }
+    }
+    return kinds;
+}
+
+std::vector<LayerKind> WeightStore::get_layer_kinds() const {
+    std::vector<LayerKind> kinds;
+    kinds.reserve(host_layers_.size());
+    for (const auto & lw : host_layers_) {
+        kinds.push_back(lw.kind);
+    }
+    return kinds;
 }
 
 bool WeightStore::init(const std::string &   gguf_filepath,
@@ -195,7 +260,7 @@ bool WeightStore::init(const std::string &   gguf_filepath,
     host_rope_freqs_ = ggml_get_tensor(host_ctx_, "rope_freqs.weight");
     host_lm_head_    = ggml_get_tensor(host_ctx_, "output.weight");
     if (!host_lm_head_) {
-        host_lm_head_ = ggml_get_tensor(host_ctx_, "token_embd.weight"); // Tied embeddings fallback
+        host_lm_head_ = ggml_get_tensor(host_ctx_, "token_embd.weight");
     }
 
     host_layers_.resize(n_local_layers_);
@@ -203,31 +268,56 @@ bool WeightStore::init(const std::string &   gguf_filepath,
                           (host_rope_freqs_ ? ggml_nbytes(host_rope_freqs_) : 0);
     max_layer_bytes_ = 0;
 
+    const int64_t expected_q_dim = static_cast<int64_t>(config.n_heads) * config.d_head_k;
+
     for (int local_l = 0; local_l < n_local_layers_; ++local_l) {
         const int    global_l = range_.start + local_l;
         std::string  prefix   = "blk." + std::to_string(global_l) + ".";
         LayerWeights & lw     = host_layers_[local_l];
 
-        lw.attn_norm   = ggml_get_tensor(host_ctx_, (prefix + "attn_norm.weight").c_str());
-        lw.wq          = ggml_get_tensor(host_ctx_, (prefix + "attn_q.weight").c_str());
-        lw.wk          = ggml_get_tensor(host_ctx_, (prefix + "attn_k.weight").c_str());
-        lw.wv          = ggml_get_tensor(host_ctx_, (prefix + "attn_v.weight").c_str());
-        lw.wo          = ggml_get_tensor(host_ctx_, (prefix + "attn_output.weight").c_str());
-        lw.ffn_norm    = ggml_get_tensor(host_ctx_, (prefix + "ffn_norm.weight").c_str());
-        lw.w_gate      = ggml_get_tensor(host_ctx_, (prefix + "ffn_gate.weight").c_str());
-        lw.w_up        = ggml_get_tensor(host_ctx_, (prefix + "ffn_up.weight").c_str());
-        lw.w_down      = ggml_get_tensor(host_ctx_, (prefix + "ffn_down.weight").c_str());
+        // Shared norms & FFN weights (with post_attention_norm fallback for hybrid architectures)
+        lw.attn_norm = ggml_get_tensor(host_ctx_, (prefix + "attn_norm.weight").c_str());
+        lw.ffn_norm  = ggml_get_tensor(host_ctx_, (prefix + "ffn_norm.weight").c_str());
+        if (!lw.ffn_norm) {
+            lw.ffn_norm = ggml_get_tensor(host_ctx_, (prefix + "post_attention_norm.weight").c_str());
+        }
+        lw.w_gate = ggml_get_tensor(host_ctx_, (prefix + "ffn_gate.weight").c_str());
+        lw.w_up   = ggml_get_tensor(host_ctx_, (prefix + "ffn_up.weight").c_str());
+        lw.w_down = ggml_get_tensor(host_ctx_, (prefix + "ffn_down.weight").c_str());
 
-        lw.attn_q_norm = ggml_get_tensor(host_ctx_, (prefix + "attn_q_norm.weight").c_str());
-        lw.attn_k_norm = ggml_get_tensor(host_ctx_, (prefix + "attn_k_norm.weight").c_str());
-        lw.bq          = ggml_get_tensor(host_ctx_, (prefix + "attn_q.bias").c_str());
-        lw.bk          = ggml_get_tensor(host_ctx_, (prefix + "attn_k.bias").c_str());
-        lw.bv          = ggml_get_tensor(host_ctx_, (prefix + "attn_v.bias").c_str());
-        lw.bo          = ggml_get_tensor(host_ctx_, (prefix + "attn_output.bias").c_str());
+        // Data-driven block kind detection from present tensors
+        struct ggml_tensor * ssm_out = ggml_get_tensor(host_ctx_, (prefix + "ssm_out.weight").c_str());
+        if (ssm_out) {
+            lw.kind        = LayerKind::GATED_DELTANET_SSM;
+            lw.attn_qkv    = ggml_get_tensor(host_ctx_, (prefix + "attn_qkv.weight").c_str());
+            lw.attn_gate   = ggml_get_tensor(host_ctx_, (prefix + "attn_gate.weight").c_str());
+            lw.ssm_conv1d  = ggml_get_tensor(host_ctx_, (prefix + "ssm_conv1d.weight").c_str());
+            lw.ssm_alpha   = ggml_get_tensor(host_ctx_, (prefix + "ssm_alpha.weight").c_str());
+            lw.ssm_beta    = ggml_get_tensor(host_ctx_, (prefix + "ssm_beta.weight").c_str());
+            lw.ssm_a       = ggml_get_tensor(host_ctx_, (prefix + "ssm_a").c_str());
+            lw.ssm_dt_bias = ggml_get_tensor(host_ctx_, (prefix + "ssm_dt.bias").c_str());
+            lw.ssm_norm    = ggml_get_tensor(host_ctx_, (prefix + "ssm_norm.weight").c_str());
+            lw.ssm_out     = ssm_out;
+        } else {
+            lw.wq          = ggml_get_tensor(host_ctx_, (prefix + "attn_q.weight").c_str());
+            lw.wk          = ggml_get_tensor(host_ctx_, (prefix + "attn_k.weight").c_str());
+            lw.wv          = ggml_get_tensor(host_ctx_, (prefix + "attn_v.weight").c_str());
+            lw.wo          = ggml_get_tensor(host_ctx_, (prefix + "attn_output.weight").c_str());
+            lw.attn_q_norm = ggml_get_tensor(host_ctx_, (prefix + "attn_q_norm.weight").c_str());
+            lw.attn_k_norm = ggml_get_tensor(host_ctx_, (prefix + "attn_k_norm.weight").c_str());
+            lw.bq          = ggml_get_tensor(host_ctx_, (prefix + "attn_q.bias").c_str());
+            lw.bk          = ggml_get_tensor(host_ctx_, (prefix + "attn_k.bias").c_str());
+            lw.bv          = ggml_get_tensor(host_ctx_, (prefix + "attn_v.bias").c_str());
+            lw.bo          = ggml_get_tensor(host_ctx_, (prefix + "attn_output.bias").c_str());
+
+            lw.kind = (lw.wq && lw.wq->ne[1] == expected_q_dim * 2)
+                          ? LayerKind::GATED_ATTENTION
+                          : LayerKind::STANDARD_ATTENTION;
+        }
 
         bool missing_req = false;
         lw.total_bytes = 0;
-        visit_layer_tensors(lw, [&](const char * field, struct ggml_tensor * t, bool required) {
+        visit_layer_tensors_impl(lw, [&](const char * field, const struct ggml_tensor * t, bool required) {
             if (required && !t) {
                 std::fprintf(stderr, "[-] WeightStore: Missing required weight '%s' in global layer %d\n",
                              field, global_l);
@@ -267,10 +357,10 @@ bool WeightStore::init(const std::string &   gguf_filepath,
     // Compute exact padded backend alloc size per local layer
     std::vector<size_t> layer_alloc_bytes(n_local_layers_, 0);
     size_t max_layer_alloc = 0;
-    size_t n_tensors_per_layer_max = 16;
+    constexpr size_t kMaxTensorsPerLayer = 24;
     for (int l = 0; l < n_local_layers_; ++l) {
-        size_t alloc = align; // initial offset alignment headroom
-        visit_layer_tensors_const(host_layers_[l], [&](const char *, const struct ggml_tensor * t, bool) {
+        size_t alloc = align;
+        visit_layer_tensors_impl(host_layers_[l], [&](const char *, const struct ggml_tensor * t, bool) {
             if (t) alloc += pad_up(ggml_backend_buft_get_alloc_size(buft, t), align);
         });
         layer_alloc_bytes[l] = alloc;
@@ -302,14 +392,12 @@ bool WeightStore::init(const std::string &   gguf_filepath,
     size_t total_resident_sum = 0;
     int resident_count = 0;
 
-    // First check if ALL owned layers fit without needing a staging buffer
     size_t all_layers_alloc = 0;
     for (int l = 0; l < n_local_layers_; ++l) all_layers_alloc += layer_alloc_bytes[l];
 
     if (all_layers_alloc <= budget) {
         resident_count = n_local_layers_;
     } else {
-        // Reserve one reusable staging buffer for streamed layers, fill remaining budget with resident layers
         size_t res_budget = (budget > max_layer_alloc) ? (budget - max_layer_alloc) : 0;
         for (int l = 0; l < n_local_layers_; ++l) {
             if (total_resident_sum + layer_alloc_bytes[l] <= res_budget) {
@@ -328,39 +416,21 @@ bool WeightStore::init(const std::string &   gguf_filepath,
 
     // Allocate and upload GPU resident layers
     if (n_resident_layers_ > 0) {
-        size_t meta_bytes = ggml_tensor_overhead() * n_tensors_per_layer_max * n_resident_layers_ + 4096;
+        size_t meta_bytes = ggml_tensor_overhead() * kMaxTensorsPerLayer * n_resident_layers_ + 4096;
         resident_ctx_ = ggml_init({ meta_bytes, nullptr, true });
 
         std::vector<std::pair<struct ggml_tensor *, const struct ggml_tensor *>> copies;
-        copies.reserve(n_tensors_per_layer_max * n_resident_layers_);
+        copies.reserve(kMaxTensorsPerLayer * n_resident_layers_);
 
         for (int l = 0; l < n_resident_layers_; ++l) {
-            const LayerWeights & src = host_layers_[l];
-            LayerWeights & dst       = active_layers_[l];
-            dst.total_bytes          = src.total_bytes;
-            dst.is_gpu_resident      = true;
-
-            auto clone_field = [&](struct ggml_tensor *& out_ptr, const struct ggml_tensor * in_ptr) {
-                if (in_ptr) {
-                    out_ptr = clone_tensor_meta(resident_ctx_, in_ptr);
-                    copies.push_back({ out_ptr, in_ptr });
-                }
-            };
-            clone_field(dst.attn_norm,   src.attn_norm);
-            clone_field(dst.wq,          src.wq);
-            clone_field(dst.wk,          src.wk);
-            clone_field(dst.wv,          src.wv);
-            clone_field(dst.wo,          src.wo);
-            clone_field(dst.ffn_norm,    src.ffn_norm);
-            clone_field(dst.w_gate,      src.w_gate);
-            clone_field(dst.w_up,        src.w_up);
-            clone_field(dst.w_down,      src.w_down);
-            clone_field(dst.attn_q_norm, src.attn_q_norm);
-            clone_field(dst.attn_k_norm, src.attn_k_norm);
-            clone_field(dst.bq,          src.bq);
-            clone_field(dst.bk,          src.bk);
-            clone_field(dst.bv,          src.bv);
-            clone_field(dst.bo,          src.bo);
+            active_layers_[l].is_gpu_resident = true;
+            transform_layer_tensors(host_layers_[l], active_layers_[l],
+                                    [&](struct ggml_tensor *& out_ptr, const struct ggml_tensor * in_ptr) {
+                                        if (in_ptr) {
+                                            out_ptr = clone_tensor_meta(resident_ctx_, in_ptr);
+                                            copies.push_back({ out_ptr, in_ptr });
+                                        }
+                                    });
         }
 
         resident_buf_ = ggml_backend_alloc_ctx_tensors(resident_ctx_, backend);
@@ -379,7 +449,7 @@ bool WeightStore::init(const std::string &   gguf_filepath,
 
     // Allocate reusable single-layer GPU staging buffer if any layers stream
     if (n_streamed_layers_ > 0) {
-        size_t stage_meta_bytes = ggml_tensor_overhead() * n_tensors_per_layer_max + 2048;
+        size_t stage_meta_bytes = ggml_tensor_overhead() * kMaxTensorsPerLayer + 2048;
         stage_ctx_ = ggml_init({ stage_meta_bytes, nullptr, true });
         stage_buf_ = ggml_backend_alloc_buffer(backend, max_layer_alloc);
         if (!stage_ctx_ || !stage_buf_) {
@@ -395,43 +465,26 @@ bool WeightStore::init(const std::string &   gguf_filepath,
     return true;
 }
 
-const LayerWeights & WeightStore::prepare_layer(int layer_idx) {
-    if (!is_gpu_ || active_layers_[layer_idx].is_gpu_resident) {
-        return active_layers_[layer_idx];
+const LayerWeights & WeightStore::prepare_layer(int local_layer_idx) {
+    if (!is_gpu_ || active_layers_[local_layer_idx].is_gpu_resident) {
+        return active_layers_[local_layer_idx];
     }
 
-    // Stream layer_idx from zero-copy mmap host RAM into reusable GPU staging buffer
-    const LayerWeights & src = host_layers_[layer_idx];
+    const LayerWeights & src = host_layers_[local_layer_idx];
     ggml_reset(stage_ctx_);
     ggml_backend_buffer_reset(stage_buf_);
     struct ggml_tallocr talloc = ggml_tallocr_new(stage_buf_);
 
     stage_weights_ = LayerWeights{};
-    stage_weights_.total_bytes     = src.total_bytes;
     stage_weights_.is_gpu_resident = false;
 
-    auto stage_tensor = [&](struct ggml_tensor *& out_ptr, const struct ggml_tensor * in_ptr) {
-        if (!in_ptr) return;
-        out_ptr = clone_tensor_meta(stage_ctx_, in_ptr);
-        ggml_tallocr_alloc(&talloc, out_ptr);
-        ggml_backend_tensor_set(out_ptr, in_ptr->data, 0, ggml_nbytes(in_ptr));
-    };
-
-    stage_tensor(stage_weights_.attn_norm,   src.attn_norm);
-    stage_tensor(stage_weights_.wq,          src.wq);
-    stage_tensor(stage_weights_.wk,          src.wk);
-    stage_tensor(stage_weights_.wv,          src.wv);
-    stage_tensor(stage_weights_.wo,          src.wo);
-    stage_tensor(stage_weights_.ffn_norm,    src.ffn_norm);
-    stage_tensor(stage_weights_.w_gate,      src.w_gate);
-    stage_tensor(stage_weights_.w_up,        src.w_up);
-    stage_tensor(stage_weights_.w_down,      src.w_down);
-    stage_tensor(stage_weights_.attn_q_norm, src.attn_q_norm);
-    stage_tensor(stage_weights_.attn_k_norm, src.attn_k_norm);
-    stage_tensor(stage_weights_.bq,          src.bq);
-    stage_tensor(stage_weights_.bk,          src.bk);
-    stage_tensor(stage_weights_.bv,          src.bv);
-    stage_tensor(stage_weights_.bo,          src.bo);
+    transform_layer_tensors(src, stage_weights_,
+                            [&](struct ggml_tensor *& out_ptr, const struct ggml_tensor * in_ptr) {
+                                if (!in_ptr) return;
+                                out_ptr = clone_tensor_meta(stage_ctx_, in_ptr);
+                                ggml_tallocr_alloc(&talloc, out_ptr);
+                                ggml_backend_tensor_set(out_ptr, in_ptr->data, 0, ggml_nbytes(in_ptr));
+                            });
 
     return stage_weights_;
 }
