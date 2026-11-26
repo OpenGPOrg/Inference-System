@@ -459,6 +459,8 @@ bool ReasoningEngine::forward_layer(int             local_layer_idx,
     if (!ggml_gallocr_alloc_graph(gallocr_, io.graph)) {
         std::fprintf(stderr, "[-] ReasoningEngine: ggml_gallocr_alloc_graph failed at local layer %d (global %d)\n",
                      local_layer_idx, layer_range_.start + local_layer_idx);
+        ggml_gallocr_free(gallocr_);
+        gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
         ggml_free(gctx);
         return false;
     }
@@ -537,6 +539,8 @@ bool ReasoningEngine::forward_gpu_fused_prefix(int             n_fused,
     if (!ggml_gallocr_alloc_graph(gallocr_, io.graph)) {
         std::fprintf(stderr, "[-] ReasoningEngine: ggml_gallocr_alloc_graph failed for GPU fused graph (%d layers)\n",
                      n_fused);
+        ggml_gallocr_free(gallocr_);
+        gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
         ggml_free(gctx);
         return false;
     }
@@ -597,6 +601,52 @@ bool ReasoningEngine::forward(const float *     H_0,
                               const int32_t *   pos_ids,
                               size_t            n_tokens,
                               ReasoningOutput & output) {
+    if (!is_initialized_ || !H_0 || !pos_ids || n_tokens == 0) {
+        return false;
+    }
+
+    const size_t n_past = kv_cache_.get_n_past();
+    if (n_past + n_tokens > kv_cache_.get_capacity()) {
+        std::fprintf(stderr, "[-] ReasoningEngine: Context limit reached (%zu > %zu tokens)\n",
+                     n_past + n_tokens, kv_cache_.get_capacity());
+        return false;
+    }
+
+    constexpr size_t kPrefillChunkSize = 512;
+    if (n_tokens <= kPrefillChunkSize) {
+        return forward_batch(H_0, pos_ids, n_tokens, output);
+    }
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+    const size_t d_model = static_cast<size_t>(config_.d_model);
+    output.H_L.resize(n_tokens * d_model);
+    output.layer_l2_norms.clear();
+
+    for (size_t offset = 0; offset < n_tokens; offset += kPrefillChunkSize) {
+        const size_t chunk = std::min(kPrefillChunkSize, n_tokens - offset);
+        ReasoningOutput chunk_out;
+        if (!forward_batch(H_0 + offset * d_model, pos_ids + offset, chunk, chunk_out)) {
+            return false;
+        }
+        std::memcpy(output.H_L.data() + offset * d_model,
+                    chunk_out.H_L.data(),
+                    chunk * d_model * sizeof(float));
+        if (offset + chunk == n_tokens) {
+            output.layer_l2_norms = std::move(chunk_out.layer_l2_norms);
+        }
+    }
+
+    auto t_end        = std::chrono::high_resolution_clock::now();
+    output.n_tokens   = n_tokens;
+    output.d_model    = d_model;
+    output.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    return true;
+}
+
+bool ReasoningEngine::forward_batch(const float *     H_0,
+                                    const int32_t *   pos_ids,
+                                    size_t            n_tokens,
+                                    ReasoningOutput & output) {
     if (!is_initialized_ || !H_0 || !pos_ids || n_tokens == 0) {
         return false;
     }

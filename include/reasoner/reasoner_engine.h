@@ -120,6 +120,10 @@ private:
                                   size_t          n_tokens,
                                   size_t          n_past,
                                   float *         H_out);
+    bool forward_batch(const float *     H_0,
+                       const int32_t *   pos_ids,
+                       size_t            n_tokens,
+                       ReasoningOutput & output);
 
     ReasoningOptions options_;
     ModelConfig      config_;
