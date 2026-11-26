@@ -157,6 +157,7 @@ void ReasoningEngine::probe_gpu_fused_ops() {
             fopts.use_flash_attn   = try_fa;
             fopts.use_swiglu       = try_swiglu;
             fopts.apply_final_norm = false;
+            fopts.pad_kv_stride    = (backend_kind_ == GpuBackendKind::CUDA && try_fa) ? 256 : 0;
             LayerGraphIO io = build_fused_layers_graph(
                 gctx, config_, probe_layers, weights_.get_rope_freqs(), nullptr, kv_cache_,
                 n_tok, 0, fopts);
@@ -526,6 +527,7 @@ bool ReasoningEngine::forward_gpu_fused_prefix(int             n_fused,
     fopts.use_flash_attn   = gpu_use_flash_attn_;
     fopts.use_swiglu       = gpu_use_swiglu_;
     fopts.apply_final_norm = apply_final_norm;
+    fopts.pad_kv_stride    = (backend_kind_ == GpuBackendKind::CUDA && gpu_use_flash_attn_) ? 256 : 0;
 
     LayerGraphIO io = build_fused_layers_graph(
         gctx, config_, resident_layers, weights_.get_rope_freqs(),
@@ -542,19 +544,31 @@ bool ReasoningEngine::forward_gpu_fused_prefix(int             n_fused,
 
     const size_t d_model = static_cast<size_t>(config_.d_model);
     const size_t n_total = n_past + n_tokens;
+    (void) kq_mask_f32;
 
     try {
         ggml_backend_tensor_set(io.H_in,    H_in,    0, n_tokens * d_model * sizeof(float));
         ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
 
-        if (io.kq_mask && kq_mask_f32) {
-            const size_t mask_elems = n_total * n_tokens;
+        if (io.kq_mask) {
+            const size_t n_kv_read  = static_cast<size_t>(io.kq_mask->ne[0]);
+            const size_t mask_elems = n_kv_read * n_tokens;
             if (io.kq_mask->type == GGML_TYPE_F16) {
-                std::vector<ggml_fp16_t> mask_f16(mask_elems);
-                ggml_fp32_to_fp16_row(kq_mask_f32, mask_f16.data(), static_cast<int64_t>(mask_elems));
+                const ggml_fp16_t zero_h    = ggml_fp32_to_fp16(0.0f);
+                const ggml_fp16_t neg_inf_h = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+                std::vector<ggml_fp16_t> mask_f16(mask_elems, neg_inf_h);
+                for (size_t i = 0; i < n_tokens; ++i) {
+                    const size_t unmasked = std::min(n_kv_read, n_past + i + 1);
+                    std::fill_n(mask_f16.data() + i * n_kv_read, unmasked, zero_h);
+                }
                 ggml_backend_tensor_set(io.kq_mask, mask_f16.data(), 0, mask_elems * sizeof(ggml_fp16_t));
             } else {
-                ggml_backend_tensor_set(io.kq_mask, kq_mask_f32, 0, mask_elems * sizeof(float));
+                std::vector<float> mask_f32(mask_elems, -std::numeric_limits<float>::infinity());
+                for (size_t i = 0; i < n_tokens; ++i) {
+                    const size_t unmasked = std::min(n_kv_read, n_past + i + 1);
+                    std::fill_n(mask_f32.data() + i * n_kv_read, unmasked, 0.0f);
+                }
+                ggml_backend_tensor_set(io.kq_mask, mask_f32.data(), 0, mask_elems * sizeof(float));
             }
         }
 
