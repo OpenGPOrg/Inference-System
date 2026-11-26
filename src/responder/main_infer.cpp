@@ -279,6 +279,12 @@ int main(int argc, char ** argv) {
                   << ws.get_n_streamed_layers() << " streamed | "
                   << std::setprecision(1) << (ws.get_vram_used_bytes() / (1024.0 * 1024.0)) << " MB VRAM / "
                   << (ws.get_total_weight_bytes() / (1024.0 * 1024.0)) << " MB total)";
+        if (reasoning.is_fused_graph_active()) {
+            std::cout << " [fused";
+            if (reasoning.is_flash_attn_active()) std::cout << "+FA";
+            if (reasoning.is_swiglu_fused_active()) std::cout << "+SwiGLU";
+            std::cout << "]";
+        }
     } else {
         std::cout << " (100% Host mmap, "
                   << std::setprecision(1) << (ws.get_total_weight_bytes() / (1024.0 * 1024.0)) << " MB)";

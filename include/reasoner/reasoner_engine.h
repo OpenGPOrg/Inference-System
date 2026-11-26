@@ -84,6 +84,11 @@ public:
 
     bool               is_gpu_active() const { return is_gpu_; }
     bool               is_igpu_active() const { return is_igpu_; }
+    bool               is_fused_graph_active() const {
+        return is_gpu_ && all_standard_attn_ && weights_.get_n_resident_layers() > 0;
+    }
+    bool               is_flash_attn_active() const { return gpu_use_flash_attn_; }
+    bool               is_swiglu_fused_active() const { return gpu_use_swiglu_; }
     GpuBackendKind     get_backend_kind() const { return backend_kind_; }
     const std::string & get_backend_name() const { return backend_name_; }
     int                get_active_threads() const { return active_threads_; }
@@ -97,15 +102,17 @@ private:
                          const ReasoningOptions & options,
                          bool                     allow_vulkan_fallback);
     bool init_backend();
+    void probe_gpu_fused_ops();
     bool preflight_vulkan_ops(std::string & unsupported_desc);
-    bool forward_vulkan_fused_prefix(int             n_fused,
-                                     bool            apply_final_norm,
-                                     const float *   H_in,
-                                     const int32_t * pos_ids,
-                                     const float *   kq_mask_f32,
-                                     size_t          n_tokens,
-                                     size_t          n_past,
-                                     float *         H_out);
+    void warmup_gpu_backend();
+    bool forward_gpu_fused_prefix(int             n_fused,
+                                  bool            apply_final_norm,
+                                  const float *   H_in,
+                                  const int32_t * pos_ids,
+                                  const float *   kq_mask_f32,
+                                  size_t          n_tokens,
+                                  size_t          n_past,
+                                  float *         H_out);
 
     ReasoningOptions options_;
     ModelConfig      config_;
@@ -119,8 +126,8 @@ private:
     bool           is_gpu_                = false;
     bool           is_igpu_               = false;
     bool           all_standard_attn_     = true;
-    bool           vulkan_use_flash_attn_ = false;
-    bool           vulkan_use_swiglu_     = false;
+    bool           gpu_use_flash_attn_    = false;
+    bool           gpu_use_swiglu_        = false;
     int            active_threads_        = 1;
     std::string    backend_name_;
 

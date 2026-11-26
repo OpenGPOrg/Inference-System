@@ -287,6 +287,16 @@ LayerGraphIO build_fused_layers_graph(struct ggml_context *                     
     const int    n_total = n_past + n_tokens;
     const size_t n_fused = layers.size();
 
+    int n_kv_read = n_total;
+    if (opts.use_flash_attn && opts.pad_kv_stride > 0) {
+        const int padded = ((n_total + opts.pad_kv_stride - 1) / opts.pad_kv_stride) * opts.pad_kv_stride;
+        if (static_cast<size_t>(padded) <= kv.get_capacity()) {
+            n_kv_read = padded;
+        }
+    }
+    const bool need_padded_mask =
+        (opts.use_flash_attn && opts.pad_kv_stride > 0 && (n_kv_read % opts.pad_kv_stride == 0));
+
     io.H_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.d_model, n_tokens);
     ggml_set_name(io.H_in, "H_in");
     ggml_set_input(io.H_in);
@@ -295,10 +305,10 @@ LayerGraphIO build_fused_layers_graph(struct ggml_context *                     
     ggml_set_name(io.pos_ids, "pos_ids");
     ggml_set_input(io.pos_ids);
 
-    // For single-token decode (n_tokens == 1), all [0 .. n_past] positions are unmasked (mask = nullptr)
-    if (n_tokens > 1) {
+    // Mask is needed for prefill (n_tokens > 1) or when padding KV slots beyond n_total
+    if (n_tokens > 1 || need_padded_mask) {
         const enum ggml_type mask_type = opts.use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
-        io.kq_mask = ggml_new_tensor_2d(ctx, mask_type, n_total, n_tokens);
+        io.kq_mask = ggml_new_tensor_2d(ctx, mask_type, n_kv_read, n_tokens);
         ggml_set_name(io.kq_mask, "kq_mask");
         ggml_set_input(io.kq_mask);
     }
@@ -349,18 +359,20 @@ LayerGraphIO build_fused_layers_graph(struct ggml_context *                     
 
         // 6. Scaled Dot-Product Causal Attention
         struct ggml_tensor * Q_perm = ggml_permute(ctx, Q, 0, 2, 1, 3); // [d_head_k, n_tokens, n_heads]
-        struct ggml_tensor * K_all  = ggml_permute(
-            ctx, kv.read_view_k(ctx, layer_idx, n_total), 0, 2, 1, 3); // [d_head_k, n_total, n_kv_heads]
 
         struct ggml_tensor * KQV_merged = nullptr;
         if (opts.use_flash_attn) {
+            struct ggml_tensor * K_all = ggml_permute(
+                ctx, kv.read_view_k(ctx, layer_idx, n_kv_read), 0, 2, 1, 3); // [d_head_k, n_kv_read, n_kv_heads]
             struct ggml_tensor * V_all = ggml_permute(
-                ctx, kv.read_view_v(ctx, layer_idx, n_total), 0, 2, 1, 3); // [d_head_v, n_total, n_kv_heads]
+                ctx, kv.read_view_v(ctx, layer_idx, n_kv_read), 0, 2, 1, 3); // [d_head_v, n_kv_read, n_kv_heads]
             struct ggml_tensor * KQV = ggml_flash_attn_ext(
                 ctx, Q_perm, K_all, V_all, io.kq_mask, scale, 0.0f, 0.0f); // [d_head_v, n_heads, n_tokens]
             KQV_merged = ggml_reshape_2d(
                 ctx, KQV, static_cast<int64_t>(cfg.d_head_v) * cfg.n_heads, n_tokens);
         } else {
+            struct ggml_tensor * K_all = ggml_permute(
+                ctx, kv.read_view_k(ctx, layer_idx, n_total), 0, 2, 1, 3); // [d_head_k, n_total, n_kv_heads]
             struct ggml_tensor * KQ      = ggml_mul_mat(ctx, K_all, Q_perm);
             struct ggml_tensor * KQ_soft = ggml_soft_max_ext(ctx, KQ, io.kq_mask, scale, 0.0f);
             struct ggml_tensor * V_all   = ggml_cont(

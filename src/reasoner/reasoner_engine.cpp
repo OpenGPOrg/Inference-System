@@ -25,6 +25,34 @@ float compute_l2_norm(const float * vec, size_t n) {
     return static_cast<float>(std::sqrt(sum));
 }
 
+bool graph_ops_supported(ggml_backend_t       backend,
+                         struct ggml_cgraph * gf,
+                         const char *         tag,
+                         std::string *        unsupported_desc) {
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!node) continue;
+        if (!ggml_backend_supports_op(backend, node)) {
+            if (unsupported_desc) {
+                std::string types;
+                if (node->src[0]) {
+                    types += ggml_type_name(node->src[0]->type);
+                    if (node->src[1]) {
+                        types += " x ";
+                        types += ggml_type_name(node->src[1]->type);
+                    }
+                    types += " -> ";
+                }
+                types += ggml_type_name(node->type);
+                *unsupported_desc = std::string(tag) + ": op " + ggml_op_desc(node) + " (" + types + ") unsupported";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 ReasoningEngine::ReasoningEngine() = default;
@@ -50,13 +78,13 @@ void ReasoningEngine::cleanup() {
         gguf_free(gctx_);
         gctx_ = nullptr;
     }
-    backend_kind_          = GpuBackendKind::NONE;
-    is_gpu_                = false;
-    is_igpu_               = false;
-    all_standard_attn_     = true;
-    vulkan_use_flash_attn_ = false;
-    vulkan_use_swiglu_     = false;
-    is_initialized_        = false;
+    backend_kind_       = GpuBackendKind::NONE;
+    is_gpu_             = false;
+    is_igpu_            = false;
+    all_standard_attn_  = true;
+    gpu_use_flash_attn_ = false;
+    gpu_use_swiglu_     = false;
+    is_initialized_     = false;
     active_ctx_size_    = 0;
     peak_scratch_bytes_ = 0;
 }
@@ -108,33 +136,53 @@ bool ReasoningEngine::init_backend() {
     return true;
 }
 
+void ReasoningEngine::probe_gpu_fused_ops() {
+    gpu_use_flash_attn_ = false;
+    gpu_use_swiglu_     = false;
+    if (!is_gpu_ || !backend_ || !all_standard_attn_ ||
+        layer_range_.count() <= 0 || weights_.get_n_resident_layers() <= 0) {
+        return;
+    }
+
+    const int                          max_probe_tokens = (active_ctx_size_ >= 2) ? 2 : 1;
+    const LayerWeights &               lw0              = weights_.prepare_layer(0);
+    std::vector<const LayerWeights *>  probe_layers     = { &lw0 };
+
+    auto probe_fused_variant = [&](bool try_fa, bool try_swiglu) -> bool {
+        for (int n_tok = 1; n_tok <= max_probe_tokens; ++n_tok) {
+            const size_t          ctx_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead();
+            struct ggml_context * gctx      = ggml_init({ ctx_bytes, nullptr, true });
+            if (!gctx) return false;
+            FusedGraphOptions fopts;
+            fopts.use_flash_attn   = try_fa;
+            fopts.use_swiglu       = try_swiglu;
+            fopts.apply_final_norm = false;
+            fopts.pad_kv_stride    = (backend_kind_ == GpuBackendKind::CUDA && try_fa) ? 256 : 0;
+            LayerGraphIO io = build_fused_layers_graph(
+                gctx, config_, probe_layers, weights_.get_rope_freqs(), nullptr, kv_cache_,
+                n_tok, 0, fopts);
+            const bool ok = graph_ops_supported(backend_, io.graph, "gpu fused probe", nullptr);
+            ggml_free(gctx);
+            if (!ok) return false;
+        }
+        return true;
+    };
+
+    try {
+        if ((config_.d_head_k % 8 == 0) && (config_.d_head_v % 8 == 0)) {
+            gpu_use_flash_attn_ = probe_fused_variant(/*try_fa=*/true, /*try_swiglu=*/false);
+        }
+        gpu_use_swiglu_ = probe_fused_variant(gpu_use_flash_attn_, /*try_swiglu=*/true);
+    } catch (...) {
+        gpu_use_flash_attn_ = false;
+        gpu_use_swiglu_     = false;
+    }
+}
+
 bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
     if (backend_kind_ != GpuBackendKind::VULKAN || !backend_) {
         return true;
     }
-
-    auto check_graph = [&](struct ggml_cgraph * gf, const char * tag) -> bool {
-        const int n_nodes = ggml_graph_n_nodes(gf);
-        for (int i = 0; i < n_nodes; ++i) {
-            struct ggml_tensor * node = ggml_graph_node(gf, i);
-            if (!node) continue;
-            if (!ggml_backend_supports_op(backend_, node)) {
-                std::string types;
-                if (node->src[0]) {
-                    types += ggml_type_name(node->src[0]->type);
-                    if (node->src[1]) {
-                        types += " x ";
-                        types += ggml_type_name(node->src[1]->type);
-                    }
-                    types += " -> ";
-                }
-                types += ggml_type_name(node->type);
-                unsupported_desc = std::string(tag) + ": op " + ggml_op_desc(node) + " (" + types + ") unsupported";
-                return false;
-            }
-        }
-        return true;
-    };
 
     try {
         std::vector<int> layers_to_check;
@@ -147,41 +195,6 @@ bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
 
         const int max_probe_tokens = (active_ctx_size_ >= 2) ? 2 : 1;
 
-        // Probe optional Vulkan fused optimizations (FlashAttention + SwiGLU) on layer 0 (standard Attention models)
-        vulkan_use_flash_attn_ = false;
-        vulkan_use_swiglu_     = false;
-        if (all_standard_attn_ && layer_range_.count() > 0 && weights_.get_n_resident_layers() > 0) {
-            const LayerWeights & lw0 = weights_.prepare_layer(0);
-            std::vector<const LayerWeights *> probe_layers = { &lw0 };
-
-            auto probe_fused_variant = [&](bool try_fa, bool try_swiglu) -> bool {
-                for (int n_tok = 1; n_tok <= max_probe_tokens; ++n_tok) {
-                    const size_t ctx_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead();
-                    struct ggml_context * gctx = ggml_init({ ctx_bytes, nullptr, true });
-                    if (!gctx) return false;
-                    FusedGraphOptions fopts;
-                    fopts.use_flash_attn   = try_fa;
-                    fopts.use_swiglu       = try_swiglu;
-                    fopts.apply_final_norm = false;
-                    LayerGraphIO io = build_fused_layers_graph(
-                        gctx, config_, probe_layers, weights_.get_rope_freqs(), nullptr, kv_cache_,
-                        n_tok, 0, fopts);
-                    const bool ok = check_graph(io.graph, "vulkan fused probe");
-                    ggml_free(gctx);
-                    if (!ok) {
-                        unsupported_desc.clear();
-                        return false;
-                    }
-                }
-                return true;
-            };
-
-            if ((config_.d_head_k % 8 == 0) && (config_.d_head_v % 8 == 0)) {
-                vulkan_use_flash_attn_ = probe_fused_variant(/*try_fa=*/true, /*try_swiglu=*/false);
-            }
-            vulkan_use_swiglu_ = probe_fused_variant(vulkan_use_flash_attn_, /*try_swiglu=*/true);
-        }
-
         for (int local_l : layers_to_check) {
             const LayerWeights & lw = weights_.prepare_layer(local_l);
             for (int n_tok = 1; n_tok <= max_probe_tokens; ++n_tok) {
@@ -193,7 +206,7 @@ bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
                 }
                 LayerGraphIO io = build_layer_graph(
                     gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, &recurrent_cache_, local_l, n_tok, 0);
-                const bool ok = check_graph(io.graph, "layer graph");
+                const bool ok = graph_ops_supported(backend_, io.graph, "layer graph", &unsupported_desc);
                 ggml_free(gctx);
                 if (!ok) return false;
             }
@@ -207,7 +220,7 @@ bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
                 return false;
             }
             FinalNormGraphIO f_io = build_final_norm_graph(gctx, config_, weights_.get_output_norm(), 1);
-            const bool ok = check_graph(f_io.graph, "final_norm graph");
+            const bool ok = graph_ops_supported(backend_, f_io.graph, "final_norm graph", &unsupported_desc);
             ggml_free(gctx);
             if (!ok) return false;
         }
@@ -219,6 +232,28 @@ bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
         unsupported_desc = "preflight unknown exception";
         return false;
     }
+}
+
+void ReasoningEngine::warmup_gpu_backend() {
+    if (backend_kind_ != GpuBackendKind::CUDA || !is_initialized_ ||
+        weights_.get_n_resident_layers() <= 0 || active_ctx_size_ < 1) {
+        return;
+    }
+
+    std::vector<float> zero_h(static_cast<size_t>(config_.d_model), 0.0f);
+    std::vector<float> dummy_out(static_cast<size_t>(config_.d_model), 0.0f);
+    const int32_t      pos0  = 0;
+    const float        mask0 = 0.0f;
+
+    if (all_standard_attn_) {
+        forward_gpu_fused_prefix(1, /*apply_final_norm=*/false, zero_h.data(), &pos0, &mask0,
+                                 1, 0, dummy_out.data());
+    } else {
+        forward_layer(0, zero_h.data(), &pos0, &mask0, 1, 0, dummy_out.data());
+    }
+
+    reset_kv_cache();
+    peak_scratch_bytes_ = 0;
 }
 
 bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
@@ -365,6 +400,8 @@ bool ReasoningEngine::initialize_impl(const std::string &      gguf_filepath,
             return fallback_to_cpu("Vulkan weight allocation failed");
         }
 
+        probe_gpu_fused_ops();
+
         // Preflight check all ops on the actual model graph before committing to Vulkan
         std::string unsupported_desc;
         if (!preflight_vulkan_ops(unsupported_desc)) {
@@ -389,6 +426,7 @@ bool ReasoningEngine::initialize_impl(const std::string &      gguf_filepath,
     }
 
     is_initialized_ = true;
+    warmup_gpu_backend();
     return true;
 }
 
@@ -461,14 +499,14 @@ bool ReasoningEngine::forward_layer(int             local_layer_idx,
     return true;
 }
 
-bool ReasoningEngine::forward_vulkan_fused_prefix(int             n_fused,
-                                                  bool            apply_final_norm,
-                                                  const float *   H_in,
-                                                  const int32_t * pos_ids,
-                                                  const float *   kq_mask_f32,
-                                                  size_t          n_tokens,
-                                                  size_t          n_past,
-                                                  float *         H_out) {
+bool ReasoningEngine::forward_gpu_fused_prefix(int             n_fused,
+                                                 bool            apply_final_norm,
+                                                 const float *   H_in,
+                                                 const int32_t * pos_ids,
+                                                 const float *   kq_mask_f32,
+                                                 size_t          n_tokens,
+                                                 size_t          n_past,
+                                                 float *         H_out) {
     if (!is_initialized_ || n_fused <= 0 || !H_in || !pos_ids || !H_out || n_tokens == 0) {
         return false;
     }
@@ -486,9 +524,10 @@ bool ReasoningEngine::forward_vulkan_fused_prefix(int             n_fused,
     if (!gctx) return false;
 
     FusedGraphOptions fopts;
-    fopts.use_flash_attn   = vulkan_use_flash_attn_;
-    fopts.use_swiglu       = vulkan_use_swiglu_;
+    fopts.use_flash_attn   = gpu_use_flash_attn_;
+    fopts.use_swiglu       = gpu_use_swiglu_;
     fopts.apply_final_norm = apply_final_norm;
+    fopts.pad_kv_stride    = (backend_kind_ == GpuBackendKind::CUDA && gpu_use_flash_attn_) ? 256 : 0;
 
     LayerGraphIO io = build_fused_layers_graph(
         gctx, config_, resident_layers, weights_.get_rope_freqs(),
@@ -496,7 +535,7 @@ bool ReasoningEngine::forward_vulkan_fused_prefix(int             n_fused,
         kv_cache_, static_cast<int>(n_tokens), static_cast<int>(n_past), fopts);
 
     if (!ggml_gallocr_alloc_graph(gallocr_, io.graph)) {
-        std::fprintf(stderr, "[-] ReasoningEngine: ggml_gallocr_alloc_graph failed for Vulkan fused graph (%d layers)\n",
+        std::fprintf(stderr, "[-] ReasoningEngine: ggml_gallocr_alloc_graph failed for GPU fused graph (%d layers)\n",
                      n_fused);
         ggml_free(gctx);
         return false;
@@ -505,35 +544,47 @@ bool ReasoningEngine::forward_vulkan_fused_prefix(int             n_fused,
 
     const size_t d_model = static_cast<size_t>(config_.d_model);
     const size_t n_total = n_past + n_tokens;
+    (void) kq_mask_f32;
 
     try {
         ggml_backend_tensor_set(io.H_in,    H_in,    0, n_tokens * d_model * sizeof(float));
         ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
 
-        if (io.kq_mask && kq_mask_f32) {
-            const size_t mask_elems = n_total * n_tokens;
+        if (io.kq_mask) {
+            const size_t n_kv_read  = static_cast<size_t>(io.kq_mask->ne[0]);
+            const size_t mask_elems = n_kv_read * n_tokens;
             if (io.kq_mask->type == GGML_TYPE_F16) {
-                std::vector<ggml_fp16_t> mask_f16(mask_elems);
-                ggml_fp32_to_fp16_row(kq_mask_f32, mask_f16.data(), static_cast<int64_t>(mask_elems));
+                const ggml_fp16_t zero_h    = ggml_fp32_to_fp16(0.0f);
+                const ggml_fp16_t neg_inf_h = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+                std::vector<ggml_fp16_t> mask_f16(mask_elems, neg_inf_h);
+                for (size_t i = 0; i < n_tokens; ++i) {
+                    const size_t unmasked = std::min(n_kv_read, n_past + i + 1);
+                    std::fill_n(mask_f16.data() + i * n_kv_read, unmasked, zero_h);
+                }
                 ggml_backend_tensor_set(io.kq_mask, mask_f16.data(), 0, mask_elems * sizeof(ggml_fp16_t));
             } else {
-                ggml_backend_tensor_set(io.kq_mask, kq_mask_f32, 0, mask_elems * sizeof(float));
+                std::vector<float> mask_f32(mask_elems, -std::numeric_limits<float>::infinity());
+                for (size_t i = 0; i < n_tokens; ++i) {
+                    const size_t unmasked = std::min(n_kv_read, n_past + i + 1);
+                    std::fill_n(mask_f32.data() + i * n_kv_read, unmasked, 0.0f);
+                }
+                ggml_backend_tensor_set(io.kq_mask, mask_f32.data(), 0, mask_elems * sizeof(float));
             }
         }
 
         if (ggml_backend_graph_compute(backend_, io.graph) != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "[-] ReasoningEngine: Vulkan fused graph execution failed (%d layers)\n", n_fused);
+            std::fprintf(stderr, "[-] ReasoningEngine: GPU fused graph execution failed (%d layers)\n", n_fused);
             ggml_free(gctx);
             return false;
         }
 
         ggml_backend_tensor_get(io.H_out, H_out, 0, n_tokens * d_model * sizeof(float));
     } catch (const std::exception & e) {
-        std::fprintf(stderr, "[-] ReasoningEngine: Vulkan fused graph exception: %s\n", e.what());
+        std::fprintf(stderr, "[-] ReasoningEngine: GPU fused graph exception: %s\n", e.what());
         ggml_free(gctx);
         return false;
     } catch (...) {
-        std::fprintf(stderr, "[-] ReasoningEngine: Unknown Vulkan fused graph exception\n");
+        std::fprintf(stderr, "[-] ReasoningEngine: Unknown GPU fused graph exception\n");
         ggml_free(gctx);
         return false;
     }
@@ -565,13 +616,14 @@ bool ReasoningEngine::forward(const float *     H_0,
 
     const bool need_final_norm = layer_range_.should_apply_final_norm(config_.n_layers);
 
-    // Vulkan-only fast path: fuse all consecutive GPU-resident layers (+ final norm if all resident)
-    // into a single graph submission to eliminate per-layer fence waits and CPU<->GPU round-trips.
-    // Hybrid SSM / Gated Attention models, CUDA, Metal, and CPU workflows use forward_layer() below.
-    const int n_vulkan_fused = (backend_kind_ == GpuBackendKind::VULKAN && all_standard_attn_)
-                                   ? weights_.get_n_resident_layers()
-                                   : 0;
-    if (n_vulkan_fused > 0 && n_vulkan_fused == n_local) {
+    // Unified GPU fast path (CUDA / Vulkan / Metal): fuse all consecutive GPU-resident
+    // standard-Attention layers (+ final norm if all resident) into a single graph submit to
+    // eliminate per-layer fence waits and CPU<->GPU round-trips. Hybrid SSM / Gated Attention
+    // models and CPU execution use forward_layer() below.
+    const int n_gpu_fused = (is_gpu_ && all_standard_attn_)
+                                ? weights_.get_n_resident_layers()
+                                : 0;
+    if (n_gpu_fused > 0 && n_gpu_fused == n_local) {
         std::vector<float> kq_mask;
         if (n_tokens > 1) {
             kq_mask.assign(n_total * n_tokens, 0.0f);
@@ -587,9 +639,9 @@ bool ReasoningEngine::forward(const float *     H_0,
         output.H_L.resize(n_tokens * d_model);
         output.layer_l2_norms.clear();
 
-        if (!forward_vulkan_fused_prefix(n_vulkan_fused, need_final_norm, H_0, pos_ids,
-                                         kq_mask.empty() ? nullptr : kq_mask.data(),
-                                         n_tokens, n_past, output.H_L.data())) {
+        if (!forward_gpu_fused_prefix(n_gpu_fused, need_final_norm, H_0, pos_ids,
+                                      kq_mask.empty() ? nullptr : kq_mask.data(),
+                                      n_tokens, n_past, output.H_L.data())) {
             return false;
         }
 
@@ -620,13 +672,13 @@ bool ReasoningEngine::forward(const float *     H_0,
     std::vector<float> * H_next = &buf_b;
 
     int start_layer = 0;
-    if (n_vulkan_fused > 0) {
-        // Hybrid Vulkan streaming: fuse resident prefix [0 .. n_vulkan_fused), then stream remainder
-        if (!forward_vulkan_fused_prefix(n_vulkan_fused, /*apply_final_norm=*/false, H_0, pos_ids,
-                                         kq_mask.data(), n_tokens, n_past, buf_a.data())) {
+    if (n_gpu_fused > 0) {
+        // Hybrid GPU streaming: fuse resident prefix [0 .. n_gpu_fused), then stream remainder
+        if (!forward_gpu_fused_prefix(n_gpu_fused, /*apply_final_norm=*/false, H_0, pos_ids,
+                                      kq_mask.data(), n_tokens, n_past, buf_a.data())) {
             return false;
         }
-        start_layer = n_vulkan_fused;
+        start_layer = n_gpu_fused;
         output.layer_l2_norms.assign(n_local, 0.0f);
     } else {
         std::memcpy(buf_a.data(), H_0, n_tokens * d_model * sizeof(float));

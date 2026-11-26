@@ -42,16 +42,17 @@ FinalNormGraphIO build_final_norm_graph(struct ggml_context *      ctx,
                                         const struct ggml_tensor * output_norm,
                                         int                        n_tokens);
 
-// Options for multi-layer fused graph construction (used exclusively by Vulkan backend)
+// Options for multi-layer fused graph construction (used by GPU backends: CUDA, Vulkan, Metal)
 struct FusedGraphOptions {
     bool use_flash_attn   = false; // Use ggml_flash_attn_ext (eliminates V transpose + KQ buffer)
     bool use_swiglu       = false; // Use fused ggml_swiglu_split instead of silu + mul
     bool apply_final_norm = false; // Fuse output_norm RMSNorm at the tail of the graph
+    int  pad_kv_stride    = 0;     // Pad FlashAttention KV read length to multiple (e.g. 256 for CUDA fast path)
 };
 
 // Build a single computation graph chaining consecutive GPU-resident layers [0 .. layers.size()-1]
-// (+ optional final RMSNorm). When n_tokens == 1, io.kq_mask is nullptr (no causal masking needed).
-// When n_tokens > 1, io.kq_mask is GGML_TYPE_F16 if use_flash_attn else GGML_TYPE_F32.
+// (+ optional final RMSNorm). When n_tokens == 1 and unpadded, io.kq_mask is nullptr.
+// Otherwise io.kq_mask has width n_kv_read and type GGML_TYPE_F16 (if use_flash_attn) or F32.
 LayerGraphIO build_fused_layers_graph(struct ggml_context *              ctx,
                                       const ModelConfig &                cfg,
                                       const std::vector<const LayerWeights *> & layers,

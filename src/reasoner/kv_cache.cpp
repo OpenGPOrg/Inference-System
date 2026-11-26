@@ -113,6 +113,12 @@ bool KVCache::allocate(size_t capacity) {
     k_layers_ = std::move(new_k);
     v_layers_ = std::move(new_v);
     capacity_ = capacity;
+
+    // Zero-initialize KV storage so padded FlashAttention reads beyond n_total never touch NaN/Inf
+    for (int l = 0; l < n_local_layers_; ++l) {
+        if (k_layers_[l]) ggml_backend_tensor_memset(k_layers_[l], 0, 0, ggml_nbytes(k_layers_[l]));
+        if (v_layers_[l]) ggml_backend_tensor_memset(v_layers_[l], 0, 0, ggml_nbytes(v_layers_[l]));
+    }
     return true;
 }
 
