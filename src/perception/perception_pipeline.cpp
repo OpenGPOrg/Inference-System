@@ -60,9 +60,21 @@ bool PerceptionPipeline::process(const std::string & user_prompt,
         return false;
     }
 
-    // Stage 1: Prompt Templating & Role Injection
-    std::string formatted_text = PromptTemplate::format(config_, user_prompt, system_prompt);
+    return process_formatted(PromptTemplate::format(config_, user_prompt, system_prompt), output);
+}
 
+bool PerceptionPipeline::process_messages(const std::vector<ChatMessage> & messages,
+                                          PerceptionOutput &               output) {
+    if (!is_initialized_) {
+        std::fprintf(stderr, "[-] PerceptionPipeline: Pipeline is not initialized!\n");
+        return false;
+    }
+
+    return process_formatted(PromptTemplate::format_messages(config_, messages), output);
+}
+
+bool PerceptionPipeline::process_formatted(const std::string & formatted_text,
+                                           PerceptionOutput &  output) {
     // Stage 2: Pre-Tokenization Regex Chunker
     output.chunks = regex_chunker_.split(formatted_text);
 

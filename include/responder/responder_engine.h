@@ -41,6 +41,7 @@ public:
 
     const LmHead &        get_lm_head() const { return lm_head_; }
     const SamplerConfig & get_sampler_config() const { return sampler_.get_config(); }
+    void                  set_sampler_config(const SamplerConfig & cfg) { sampler_.configure(cfg); }
 
 private:
     LmHead               lm_head_;

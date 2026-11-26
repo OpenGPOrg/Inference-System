@@ -3,38 +3,48 @@
 namespace opengp {
 namespace perception {
 
-std::string PromptTemplate::format(const TokenizerConfig & config, 
-                                   const std::string & user_prompt, 
+std::string PromptTemplate::format(const TokenizerConfig & config,
+                                   const std::string & user_prompt,
                                    const std::string & system_prompt) {
+    std::vector<ChatMessage> messages;
+    if (!system_prompt.empty()) {
+        messages.push_back({ "system", system_prompt });
+    }
+    messages.push_back({ "user", user_prompt });
+    return format_messages(config, messages);
+}
+
+std::string PromptTemplate::format_messages(const TokenizerConfig &          config,
+                                            const std::vector<ChatMessage> & messages) {
     // 1. Qwen / ChatML format
-    if (config.pre_tokenizer == "qwen2" || config.pre_tokenizer == "qwen35" || 
+    if (config.pre_tokenizer == "qwen2" || config.pre_tokenizer == "qwen35" ||
         config.chat_template.find("<|im_start|>") != std::string::npos) {
         std::string out;
-        if (!system_prompt.empty()) {
-            out += "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+        for (const auto & msg : messages) {
+            out += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
         }
-        out += "<|im_start|>user\n" + user_prompt + "<|im_end|>\n";
         out += "<|im_start|>assistant\n";
         return out;
     }
 
     // 2. LLaMA-3 Header format
-    if (config.pre_tokenizer == "llama3" || 
+    if (config.pre_tokenizer == "llama3" ||
         config.chat_template.find("<|start_header_id|>") != std::string::npos) {
         std::string out = "<|begin_of_text|>";
-        if (!system_prompt.empty()) {
-            out += "<|start_header_id|>system<|end_header_id|>\n\n" + system_prompt + "<|eot_id|>";
+        for (const auto & msg : messages) {
+            out += "<|start_header_id|>" + msg.role + "<|end_header_id|>\n\n" + msg.content + "<|eot_id|>";
         }
-        out += "<|start_header_id|>user<|end_header_id|>\n\n" + user_prompt + "<|eot_id|>";
         out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
         return out;
     }
 
     // 3. Raw / Fallback completion mode (e.g. Stories-15M or base foundation models)
-    if (!system_prompt.empty()) {
-        return system_prompt + "\n" + user_prompt;
+    std::string out;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        if (i > 0) out += "\n";
+        out += messages[i].content;
     }
-    return user_prompt;
+    return out;
 }
 
 } // namespace perception

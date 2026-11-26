@@ -74,3 +74,14 @@ target_link_libraries(opengp_responder_core PUBLIC ggml opengp_perception_core o
 # -----------------------------------------------------------------------------
 add_executable(opengp_infer src/responder/main_infer.cpp)
 target_link_libraries(opengp_infer PRIVATE opengp_responder_core)
+
+# -----------------------------------------------------------------------------
+# 8. Standalone OpenAI-Compatible HTTP Server Executable (/v1/chat/completions)
+# -----------------------------------------------------------------------------
+find_package(Threads REQUIRED)
+add_executable(opengp_server
+    src/server/mini_json.cpp
+    src/server/http_server.cpp
+    src/server/main_server.cpp
+)
+target_link_libraries(opengp_server PRIVATE opengp_responder_core Threads::Threads)

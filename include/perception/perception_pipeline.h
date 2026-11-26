@@ -40,6 +40,10 @@ public:
                  PerceptionOutput & output, 
                  const std::string & system_prompt = "");
 
+    // Multi-turn conversation history variant of process()
+    bool process_messages(const std::vector<ChatMessage> & messages,
+                          PerceptionOutput &               output);
+
     // Single-token embedding helper for Phase 3 Autoregressive Decode loop
     bool embed_token(int32_t token_id, float * out_vec) const;
 
@@ -48,6 +52,7 @@ public:
     const EmbedTable &      get_embed_table() const { return embed_table_; }
 
 private:
+    bool process_formatted(const std::string & formatted_text, PerceptionOutput & output);
     std::string model_filepath_;
     TokenizerConfig config_;
     DynamicRegex regex_chunker_;

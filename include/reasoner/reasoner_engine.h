@@ -74,6 +74,13 @@ public:
                                    std::vector<float> & out_logits) const;
 
     void reset_kv_cache();
+    void truncate_kv_cache(size_t new_n_past) {
+        if (config_.is_hybrid_ssm()) {
+            reset_kv_cache();
+        } else {
+            kv_cache_.truncate(new_n_past);
+        }
+    }
 
     const ModelConfig &      get_config() const { return config_; }
     const ReasoningOptions & get_options() const { return options_; }

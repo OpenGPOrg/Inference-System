@@ -37,6 +37,7 @@ public:
     struct ggml_tensor * read_view_v(struct ggml_context * ctx, int local_layer_idx, size_t n_total) const;
 
     void advance(size_t n_tokens) { n_past_ += n_tokens; }
+    void truncate(size_t new_n_past) { if (new_n_past < n_past_) n_past_ = new_n_past; }
     void reset() { n_past_ = 0; }
     void release() { cleanup(); }
 
