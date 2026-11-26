@@ -165,7 +165,7 @@ void print_usage(const char * prog) {
               << "OpenGP OpenAI-Compatible Inference Server (/v1/chat/completions, /v1/models)\n\n"
               << "Server:\n"
               << "  --model <path>           Path to GGUF model file (required)\n"
-              << "  --host <ip>              Bind address (default: 127.0.0.1)\n"
+              << "  --host <ip>              Bind address (default: 0.0.0.0)\n"
               << "  --port <N>               Listen port (default: 8080)\n"
               << "  --model-name <id>        Model ID advertised in /v1/models (default: filename)\n"
               << "  --max-tokens <N>         Default max completion tokens (default: 512)\n\n"
@@ -193,7 +193,7 @@ void print_usage(const char * prog) {
 int main(int argc, char ** argv) {
     std::string       model_path;
     std::string       model_name;
-    std::string       host        = "127.0.0.1";
+    std::string       host        = "0.0.0.0";
     int               port        = 8080;
     size_t            default_max = 512;
     ReasoningOptions  r_opts;
