@@ -96,6 +96,14 @@ private:
                          bool                     allow_vulkan_fallback);
     bool init_backend();
     bool preflight_vulkan_ops(std::string & unsupported_desc);
+    bool forward_vulkan_fused_prefix(int             n_fused,
+                                     bool            apply_final_norm,
+                                     const float *   H_in,
+                                     const int32_t * pos_ids,
+                                     const float *   kq_mask_f32,
+                                     size_t          n_tokens,
+                                     size_t          n_past,
+                                     float *         H_out);
 
     ReasoningOptions options_;
     ModelConfig      config_;
@@ -103,12 +111,14 @@ private:
 
     struct gguf_context * gctx_ = nullptr;
 
-    ggml_backend_t backend_        = nullptr;
-    ggml_gallocr_t gallocr_        = nullptr;
-    GpuBackendKind backend_kind_   = GpuBackendKind::NONE;
-    bool           is_gpu_         = false;
-    bool           is_igpu_        = false;
-    int            active_threads_ = 1;
+    ggml_backend_t backend_               = nullptr;
+    ggml_gallocr_t gallocr_               = nullptr;
+    GpuBackendKind backend_kind_          = GpuBackendKind::NONE;
+    bool           is_gpu_                = false;
+    bool           is_igpu_               = false;
+    bool           vulkan_use_flash_attn_ = false;
+    bool           vulkan_use_swiglu_     = false;
+    int            active_threads_        = 1;
     std::string    backend_name_;
 
     WeightStore weights_;

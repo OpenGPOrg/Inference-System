@@ -243,13 +243,15 @@ int main(int argc, char ** argv) {
     std::cout << "[Integrity] Finite Check: " << (finite ? "PASS (0 NaN, 0 Inf)" : "FAIL")
               << " (NaN=" << nan_cnt << ", Inf=" << inf_cnt << ")\n";
 
-    std::cout << "[Layer L2]  Norms (last token): ";
-    for (size_t l = 0; l < r_out.layer_l2_norms.size(); ++l) {
-        if (l == 0 || l + 1 == r_out.layer_l2_norms.size() || l % std::max<size_t>(1, r_out.layer_l2_norms.size() / 6) == 0) {
-            std::cout << "L" << l << "=" << std::setprecision(2) << r_out.layer_l2_norms[l] << " ";
+    if (!r_out.layer_l2_norms.empty()) {
+        std::cout << "[Layer L2]  Norms (last token): ";
+        for (size_t l = 0; l < r_out.layer_l2_norms.size(); ++l) {
+            if (l == 0 || l + 1 == r_out.layer_l2_norms.size() || l % std::max<size_t>(1, r_out.layer_l2_norms.size() / 6) == 0) {
+                std::cout << "L" << l << "=" << std::setprecision(2) << r_out.layer_l2_norms[l] << " ";
+            }
         }
+        std::cout << "\n";
     }
-    std::cout << "\n";
 
     std::cout << "\n>>> HIDDEN STATE SAMPLES (H_in -> H_out after layers ["
               << lr.start << ".." << lr.end << ")"
