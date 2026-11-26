@@ -30,7 +30,7 @@ void print_usage(const char * prog) {
               << "  --prompt <text>          User prompt string\n"
               << "  --system <text>          Optional system prompt string\n"
               << "  --device auto|gpu|cpu    Execution device preference (default: auto)\n"
-              << "  --gpu-id <id>            CUDA device index (default: 0)\n"
+              << "  --gpu-id <id>            GPU device index (default: auto; CUDA or Vulkan)\n"
               << "  --threads <N>            CPU worker threads (default: 0 = auto)\n"
               << "  --kv-precision f16|f32   KV cache element precision (default: f16)\n"
               << "  --ctx-size <N>           Fixed context window size (default: 512; halved on init if VRAM low)\n"
@@ -210,7 +210,10 @@ int main(int argc, char ** argv) {
                   << " MB)\n";
     }
     const auto & init_kv = engine.get_kv_cache();
-    std::cout << "[KV Cache] Memory       : " << (engine.is_gpu_active() ? "CUDA VRAM" : "Host RAM")
+    const char * kv_mem_label = !engine.is_gpu_active()
+        ? "Host RAM"
+        : (engine.is_igpu_active() ? "GPU Shared Memory" : "GPU VRAM");
+    std::cout << "[KV Cache] Memory       : " << kv_mem_label
               << " | allocated=" << std::setprecision(2) << (init_kv.total_bytes() / (1024.0 * 1024.0))
               << " MB (ctx=" << init_kv.get_capacity() << " tokens, "
               << std::setprecision(1) << (init_kv.bytes_per_token() / 1024.0) << " KB/tok, "

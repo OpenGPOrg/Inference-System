@@ -14,7 +14,7 @@ namespace responder {
 
 struct RespondingOptions {
     LmHeadDevice  lm_head_device = LmHeadDevice::AUTO;
-    int           gpu_device_id  = 0;
+    int           gpu_device_id  = -1;
     int           n_threads      = 0;
     SamplerConfig sampler;
 };
