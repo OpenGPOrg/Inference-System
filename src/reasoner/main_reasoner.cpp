@@ -30,7 +30,7 @@ void print_usage(const char * prog) {
               << "  --prompt <text>          User prompt string\n"
               << "  --system <text>          Optional system prompt string\n"
               << "  --device auto|gpu|cpu    Execution device preference (default: auto)\n"
-              << "  --gpu-id <id>            CUDA device index (default: 0)\n"
+              << "  --gpu-id <id>            GPU device index (default: auto; CUDA or Vulkan)\n"
               << "  --threads <N>            CPU worker threads (default: 0 = auto)\n"
               << "  --kv-precision f16|f32   KV cache element precision (default: f16)\n"
               << "  --ctx-size <N>           Fixed context window size (default: 512; halved on init if VRAM low)\n"
@@ -211,14 +211,17 @@ int main(int argc, char ** argv) {
     }
     const auto & init_kv  = engine.get_kv_cache();
     const auto & init_ssm = engine.get_recurrent_cache();
-    std::cout << "[KV Cache] Memory       : " << (engine.is_gpu_active() ? "Device VRAM" : "Host RAM")
+    const char * kv_mem_label = !engine.is_gpu_active()
+        ? "Host RAM"
+        : (engine.is_igpu_active() ? "GPU Shared Memory" : "GPU VRAM");
+    std::cout << "[KV Cache] Memory       : " << kv_mem_label
               << " | allocated=" << std::setprecision(2) << (init_kv.total_bytes() / (1024.0 * 1024.0))
               << " MB (ctx=" << init_kv.get_capacity() << " tokens, "
               << init_kv.get_n_attn_layers() << " attn layers, "
               << std::setprecision(1) << (init_kv.bytes_per_token() / 1024.0) << " KB/tok, "
               << ggml_type_name(init_kv.get_dtype()) << ")\n";
     if (init_ssm.get_n_ssm_layers() > 0) {
-        std::cout << "[SSM State] Memory      : " << (engine.is_gpu_active() ? "Device VRAM" : "Host RAM")
+        std::cout << "[SSM State] Memory      : " << kv_mem_label
                   << " | allocated=" << std::setprecision(2) << (init_ssm.total_bytes() / (1024.0 * 1024.0))
                   << " MB (" << init_ssm.get_n_ssm_layers() << " SSM layers, fixed O(1))\n";
     }
@@ -247,13 +250,15 @@ int main(int argc, char ** argv) {
     std::cout << "[Integrity] Finite Check: " << (finite ? "PASS (0 NaN, 0 Inf)" : "FAIL")
               << " (NaN=" << nan_cnt << ", Inf=" << inf_cnt << ")\n";
 
-    std::cout << "[Layer L2]  Norms (last token): ";
-    for (size_t l = 0; l < r_out.layer_l2_norms.size(); ++l) {
-        if (l == 0 || l + 1 == r_out.layer_l2_norms.size() || l % std::max<size_t>(1, r_out.layer_l2_norms.size() / 6) == 0) {
-            std::cout << "L" << l << "=" << std::setprecision(2) << r_out.layer_l2_norms[l] << " ";
+    if (!r_out.layer_l2_norms.empty()) {
+        std::cout << "[Layer L2]  Norms (last token): ";
+        for (size_t l = 0; l < r_out.layer_l2_norms.size(); ++l) {
+            if (l == 0 || l + 1 == r_out.layer_l2_norms.size() || l % std::max<size_t>(1, r_out.layer_l2_norms.size() / 6) == 0) {
+                std::cout << "L" << l << "=" << std::setprecision(2) << r_out.layer_l2_norms[l] << " ";
+            }
         }
+        std::cout << "\n";
     }
-    std::cout << "\n";
 
     std::cout << "\n>>> HIDDEN STATE SAMPLES (H_in -> H_out after layers ["
               << lr.start << ".." << lr.end << ")"

@@ -38,6 +38,7 @@ public:
 
     void advance(size_t n_tokens) { n_past_ += n_tokens; }
     void reset() { n_past_ = 0; }
+    void release() { cleanup(); }
 
     int    get_n_local_layers() const { return n_local_layers_; }
     int    get_n_attn_layers() const { return n_attn_layers_; }

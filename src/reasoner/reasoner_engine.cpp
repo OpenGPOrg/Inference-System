@@ -3,19 +3,12 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
-#if OPENGP_HAS_CUDA
-#include "ggml-cuda.h"
-#endif
-
-#if OPENGP_HAS_METAL
-#include "ggml-metal.h"
-#endif
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <thread>
 
@@ -45,6 +38,10 @@ void ReasoningEngine::cleanup() {
         ggml_gallocr_free(gallocr_);
         gallocr_ = nullptr;
     }
+    // Release backend-owned buffers before freeing the backend itself
+    recurrent_cache_.release();
+    kv_cache_.release();
+    weights_.release();
     if (backend_) {
         ggml_backend_free(backend_);
         backend_ = nullptr;
@@ -53,7 +50,13 @@ void ReasoningEngine::cleanup() {
         gguf_free(gctx_);
         gctx_ = nullptr;
     }
-    is_initialized_     = false;
+    backend_kind_          = GpuBackendKind::NONE;
+    is_gpu_                = false;
+    is_igpu_               = false;
+    all_standard_attn_     = true;
+    vulkan_use_flash_attn_ = false;
+    vulkan_use_swiglu_     = false;
+    is_initialized_        = false;
     active_ctx_size_    = 0;
     peak_scratch_bytes_ = 0;
 }
@@ -62,34 +65,29 @@ bool ReasoningEngine::init_backend() {
     const bool want_gpu = (options_.device == DevicePreference::GPU || options_.device == DevicePreference::AUTO);
 
     if (want_gpu) {
-#if OPENGP_HAS_CUDA
-        const int gpu_count = ggml_backend_cuda_get_device_count();
-        if (gpu_count > 0 && options_.gpu_device_id >= 0 && options_.gpu_device_id < gpu_count) {
-            backend_ = ggml_backend_cuda_init(options_.gpu_device_id);
-            if (backend_) {
-                char desc[256] = {};
-                ggml_backend_cuda_get_device_description(options_.gpu_device_id, desc, sizeof(desc));
-                backend_name_ = std::string("CUDA (") + desc + ")";
-                is_gpu_       = true;
-                return true;
-            }
-        }
-#endif
-
-#if OPENGP_HAS_METAL
-        backend_ = ggml_backend_metal_init();
-        if (backend_) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
-            const char * desc = dev ? ggml_backend_dev_description(dev) : "Apple GPU";
-            backend_name_ = std::string("Metal (") + (desc ? desc : "Apple GPU") + ")";
+        const bool allow_slow_igpu = (options_.device == DevicePreference::GPU);
+        GpuBackendSelection sel = select_gpu_backend(options_.gpu_device_id, options_.n_threads, allow_slow_igpu);
+        if (sel.backend) {
+            backend_      = sel.backend;
+            backend_kind_ = sel.kind;
+            backend_name_ = sel.label;
             is_gpu_       = true;
+            is_igpu_      = sel.is_igpu;
             return true;
         }
-#endif
 
         if (options_.device == DevicePreference::GPU) {
-            std::fprintf(stderr, "[-] ReasoningEngine: GPU requested, but no CUDA or Metal device available\n");
+            const char * reason = sel.fail_reason.empty()
+                                      ? "no CUDA, Metal, or Vulkan GPU device available"
+                                      : sel.fail_reason.c_str();
+            std::fprintf(stderr, "[-] ReasoningEngine: GPU requested, but no GPU backend available (%s)\n",
+                         reason);
             return false;
+        }
+
+        if (!sel.fail_reason.empty()) {
+            std::fprintf(stderr, "[!] ReasoningEngine: %s — falling back to CPU\n",
+                         sel.fail_reason.c_str());
         }
     }
 
@@ -103,13 +101,134 @@ bool ReasoningEngine::init_backend() {
     active_threads_ = (options_.n_threads > 0) ? options_.n_threads : std::max(1, hw_threads);
     ggml_backend_cpu_set_n_threads(backend_, active_threads_);
 
+    backend_kind_ = GpuBackendKind::NONE;
     backend_name_ = "CPU (" + std::to_string(active_threads_) + " threads)";
     is_gpu_       = false;
+    is_igpu_      = false;
     return true;
+}
+
+bool ReasoningEngine::preflight_vulkan_ops(std::string & unsupported_desc) {
+    if (backend_kind_ != GpuBackendKind::VULKAN || !backend_) {
+        return true;
+    }
+
+    auto check_graph = [&](struct ggml_cgraph * gf, const char * tag) -> bool {
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; ++i) {
+            struct ggml_tensor * node = ggml_graph_node(gf, i);
+            if (!node) continue;
+            if (!ggml_backend_supports_op(backend_, node)) {
+                std::string types;
+                if (node->src[0]) {
+                    types += ggml_type_name(node->src[0]->type);
+                    if (node->src[1]) {
+                        types += " x ";
+                        types += ggml_type_name(node->src[1]->type);
+                    }
+                    types += " -> ";
+                }
+                types += ggml_type_name(node->type);
+                unsupported_desc = std::string(tag) + ": op " + ggml_op_desc(node) + " (" + types + ") unsupported";
+                return false;
+            }
+        }
+        return true;
+    };
+
+    try {
+        std::vector<int> layers_to_check;
+        if (layer_range_.count() > 0) {
+            layers_to_check.push_back(0);
+            if (layer_range_.count() > 1) {
+                layers_to_check.push_back(layer_range_.count() - 1);
+            }
+        }
+
+        const int max_probe_tokens = (active_ctx_size_ >= 2) ? 2 : 1;
+
+        // Probe optional Vulkan fused optimizations (FlashAttention + SwiGLU) on layer 0 (standard Attention models)
+        vulkan_use_flash_attn_ = false;
+        vulkan_use_swiglu_     = false;
+        if (all_standard_attn_ && layer_range_.count() > 0 && weights_.get_n_resident_layers() > 0) {
+            const LayerWeights & lw0 = weights_.prepare_layer(0);
+            std::vector<const LayerWeights *> probe_layers = { &lw0 };
+
+            auto probe_fused_variant = [&](bool try_fa, bool try_swiglu) -> bool {
+                for (int n_tok = 1; n_tok <= max_probe_tokens; ++n_tok) {
+                    const size_t ctx_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead();
+                    struct ggml_context * gctx = ggml_init({ ctx_bytes, nullptr, true });
+                    if (!gctx) return false;
+                    FusedGraphOptions fopts;
+                    fopts.use_flash_attn   = try_fa;
+                    fopts.use_swiglu       = try_swiglu;
+                    fopts.apply_final_norm = false;
+                    LayerGraphIO io = build_fused_layers_graph(
+                        gctx, config_, probe_layers, weights_.get_rope_freqs(), nullptr, kv_cache_,
+                        n_tok, 0, fopts);
+                    const bool ok = check_graph(io.graph, "vulkan fused probe");
+                    ggml_free(gctx);
+                    if (!ok) {
+                        unsupported_desc.clear();
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            if ((config_.d_head_k % 8 == 0) && (config_.d_head_v % 8 == 0)) {
+                vulkan_use_flash_attn_ = probe_fused_variant(/*try_fa=*/true, /*try_swiglu=*/false);
+            }
+            vulkan_use_swiglu_ = probe_fused_variant(vulkan_use_flash_attn_, /*try_swiglu=*/true);
+        }
+
+        for (int local_l : layers_to_check) {
+            const LayerWeights & lw = weights_.prepare_layer(local_l);
+            for (int n_tok = 1; n_tok <= max_probe_tokens; ++n_tok) {
+                const size_t ctx_bytes = ggml_tensor_overhead() * 256 + ggml_graph_overhead();
+                struct ggml_context * gctx = ggml_init({ ctx_bytes, nullptr, true });
+                if (!gctx) {
+                    unsupported_desc = "preflight ggml_init failed";
+                    return false;
+                }
+                LayerGraphIO io = build_layer_graph(
+                    gctx, config_, lw, weights_.get_rope_freqs(), kv_cache_, &recurrent_cache_, local_l, n_tok, 0);
+                const bool ok = check_graph(io.graph, "layer graph");
+                ggml_free(gctx);
+                if (!ok) return false;
+            }
+        }
+
+        if (layer_range_.should_apply_final_norm(config_.n_layers)) {
+            const size_t ctx_bytes = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
+            struct ggml_context * gctx = ggml_init({ ctx_bytes, nullptr, true });
+            if (!gctx) {
+                unsupported_desc = "preflight final_norm ggml_init failed";
+                return false;
+            }
+            FinalNormGraphIO f_io = build_final_norm_graph(gctx, config_, weights_.get_output_norm(), 1);
+            const bool ok = check_graph(f_io.graph, "final_norm graph");
+            ggml_free(gctx);
+            if (!ok) return false;
+        }
+        return true;
+    } catch (const std::exception & e) {
+        unsupported_desc = std::string("preflight exception: ") + e.what();
+        return false;
+    } catch (...) {
+        unsupported_desc = "preflight unknown exception";
+        return false;
+    }
 }
 
 bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
                                  const ReasoningOptions & options) {
+    return initialize_impl(gguf_filepath, options, options.device == DevicePreference::AUTO);
+}
+
+bool ReasoningEngine::initialize_impl(const std::string &      gguf_filepath,
+                                      const ReasoningOptions & options,
+                                      bool                     allow_vulkan_fallback) {
     cleanup();
     options_ = options;
 
@@ -143,83 +262,130 @@ bool ReasoningEngine::initialize(const std::string &      gguf_filepath,
         return false;
     }
 
-    const std::vector<LayerKind> layer_kinds = WeightStore::detect_layer_kinds(gctx_, config_, layer_range_);
-
-    // 1. Fixed O(1) recurrent states for SSM layers (no-op if pure Attention)
-    if (!recurrent_cache_.init(config_, layer_kinds, backend_)) {
-        cleanup();
-        return false;
-    }
-
-    // 2. Sparse KV cache for Attention layers only
-    if (!kv_cache_.init(config_, layer_kinds, backend_, options_.kv_precision)) {
-        cleanup();
-        return false;
-    }
-
-    // Allocate fixed KV cache upfront (default 512 tokens), halving by 2 if memory is insufficient
-    const size_t requested_ctx = (options_.ctx_size > 0) ? options_.ctx_size : 512;
-    size_t       target_ctx    = requested_ctx;
-
-    const float util = std::clamp(options_.vram_utilization, 0.10f, 0.95f);
-    size_t max_kv_vram = 0;
-    if (is_gpu_) {
-        size_t free_vram = 0, total_vram = 0;
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
-        if (dev) {
-            ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+    auto fallback_to_cpu = [&](const std::string & reason) -> bool {
+        if (allow_vulkan_fallback && backend_kind_ == GpuBackendKind::VULKAN) {
+            std::fprintf(stderr, "[!] ReasoningEngine: %s — re-initializing on CPU\n", reason.c_str());
+            ReasoningOptions cpu_opts = options;
+            cpu_opts.device = DevicePreference::CPU;
+            return initialize_impl(gguf_filepath, cpu_opts, /*allow_vulkan_fallback=*/false);
         }
-        size_t usable_vram = static_cast<size_t>(static_cast<double>(free_vram) * util);
-        size_t min_non_kv  = 512ULL * 1024ULL * 1024ULL; // Reserve headroom for staging layer + scratch
-        max_kv_vram        = (usable_vram > min_non_kv) ? (usable_vram - min_non_kv) : (usable_vram / 2);
-    }
+        cleanup();
+        return false;
+    };
 
-    while (target_ctx >= 1) {
-        if (is_gpu_ && kv_cache_.bytes_per_token() * target_ctx > max_kv_vram) {
+    try {
+        const std::vector<LayerKind> layer_kinds = WeightStore::detect_layer_kinds(gctx_, config_, layer_range_);
+        all_standard_attn_ = std::all_of(layer_kinds.begin(), layer_kinds.end(), [](LayerKind k) {
+            return k == LayerKind::STANDARD_ATTENTION;
+        });
+
+        // 1. Fixed O(1) recurrent states for SSM layers (no-op if pure Attention)
+        if (!recurrent_cache_.init(config_, layer_kinds, backend_)) {
+            return fallback_to_cpu("Vulkan recurrent cache init failed");
+        }
+
+        // 2. Sparse KV cache for Attention layers only
+        if (!kv_cache_.init(config_, layer_kinds, backend_, options_.kv_precision)) {
+            return fallback_to_cpu("Vulkan KV cache init failed");
+        }
+
+        // Allocate fixed KV cache upfront (default 512 tokens), halving by 2 if memory is insufficient
+        const size_t requested_ctx = (options_.ctx_size > 0) ? options_.ctx_size : 512;
+        size_t       target_ctx    = requested_ctx;
+
+        const float util = std::clamp(options_.vram_utilization, 0.10f, 0.95f);
+        size_t max_kv_vram        = 0;
+        size_t igpu_total_budget  = 0;
+        const bool is_vulkan_igpu = (backend_kind_ == GpuBackendKind::VULKAN && is_igpu_);
+
+        if (is_gpu_) {
+            size_t free_vram = 0, total_vram = 0;
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+            if (dev) {
+                ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+            }
+            size_t usable_vram = static_cast<size_t>(static_cast<double>(free_vram) * util);
+            if (is_vulkan_igpu) {
+                // On integrated GPUs, Vulkan heaps are shared system RAM already used by the OS and mmap
+                igpu_total_budget = std::min(usable_vram, free_vram / 2);
+                usable_vram       = igpu_total_budget;
+                std::fprintf(stderr,
+                             "[!] ReasoningEngine: Vulkan iGPU detected (shared system memory) — "
+                             "capping GPU budget to %.1f MB (of %.1f MB reported free)\n",
+                             usable_vram / (1024.0 * 1024.0),
+                             free_vram / (1024.0 * 1024.0));
+            }
+            size_t min_non_kv = 512ULL * 1024ULL * 1024ULL; // Reserve headroom for staging layer + scratch
+            max_kv_vram       = (usable_vram > min_non_kv) ? (usable_vram - min_non_kv) : (usable_vram / 2);
+        }
+
+        while (target_ctx >= 1) {
+            if (is_gpu_ && kv_cache_.bytes_per_token() * target_ctx > max_kv_vram) {
+                target_ctx /= 2;
+                continue;
+            }
+            if (kv_cache_.allocate(target_ctx)) {
+                break;
+            }
             target_ctx /= 2;
-            continue;
-        }
-        if (kv_cache_.allocate(target_ctx)) {
-            break;
-        }
-        target_ctx /= 2;
-    }
-
-    if (target_ctx == 0) {
-        std::fprintf(stderr, "[-] ReasoningEngine: Unable to allocate KV cache even for 1 token\n");
-        cleanup();
-        return false;
-    }
-    if (target_ctx < requested_ctx) {
-        std::printf("[!] ReasoningEngine: Insufficient memory for ctx_size=%zu, halved to ctx_size=%zu (%.2f MB KV)\n",
-                    requested_ctx, target_ctx, kv_cache_.total_bytes() / (1024.0 * 1024.0));
-    }
-    active_ctx_size_ = target_ctx;
-
-    // Query remaining VRAM after KV allocation so WeightStore assigns resident vs streamed layers cleanly
-    size_t weight_vram_budget = 0;
-    if (is_gpu_) {
-        size_t free_vram = 0, total_vram = 0;
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
-        if (dev) {
-            ggml_backend_dev_memory(dev, &free_vram, &total_vram);
         }
 
-        size_t usable_vram     = static_cast<size_t>(static_cast<double>(free_vram) * util);
-        size_t scratch_reserve = 256ULL * 1024ULL * 1024ULL;
-        weight_vram_budget     = (usable_vram > scratch_reserve) ? (usable_vram - scratch_reserve) : (usable_vram / 2);
-    }
+        if (target_ctx == 0) {
+            std::fprintf(stderr, "[-] ReasoningEngine: Unable to allocate KV cache even for 1 token\n");
+            return fallback_to_cpu("Vulkan KV cache allocation failed");
+        }
+        if (target_ctx < requested_ctx) {
+            std::printf("[!] ReasoningEngine: Insufficient memory for ctx_size=%zu, halved to ctx_size=%zu (%.2f MB KV)\n",
+                        requested_ctx, target_ctx, kv_cache_.total_bytes() / (1024.0 * 1024.0));
+        }
+        active_ctx_size_ = target_ctx;
 
-    if (!weights_.init(gguf_filepath, gctx_, config_, layer_range_, backend_, is_gpu_, weight_vram_budget)) {
-        cleanup();
-        return false;
-    }
+        // Query remaining VRAM after KV allocation so WeightStore assigns resident vs streamed layers cleanly
+        size_t weight_vram_budget = 0;
+        if (is_gpu_) {
+            size_t free_vram = 0, total_vram = 0;
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+            if (dev) {
+                ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+            }
 
-    gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
-    if (!gallocr_) {
-        std::fprintf(stderr, "[-] ReasoningEngine: Failed to create ggml_gallocr\n");
-        cleanup();
-        return false;
+            size_t usable_vram = static_cast<size_t>(static_cast<double>(free_vram) * util);
+            if (is_vulkan_igpu) {
+                const size_t state_bytes = kv_cache_.total_bytes() + recurrent_cache_.total_bytes();
+                size_t remaining_cap = (igpu_total_budget > state_bytes)
+                                           ? (igpu_total_budget - state_bytes)
+                                           : 0;
+                usable_vram = std::min(usable_vram, remaining_cap);
+            }
+            size_t scratch_reserve = 256ULL * 1024ULL * 1024ULL;
+            weight_vram_budget     = (usable_vram > scratch_reserve) ? (usable_vram - scratch_reserve) : (usable_vram / 2);
+        }
+
+        if (!weights_.init(gguf_filepath, gctx_, config_, layer_range_, backend_, is_gpu_, weight_vram_budget)) {
+            return fallback_to_cpu("Vulkan weight allocation failed");
+        }
+
+        // Preflight check all ops on the actual model graph before committing to Vulkan
+        std::string unsupported_desc;
+        if (!preflight_vulkan_ops(unsupported_desc)) {
+            if (backend_kind_ == GpuBackendKind::VULKAN && options_.device == DevicePreference::GPU) {
+                std::fprintf(stderr, "[-] ReasoningEngine: Vulkan preflight failed (%s)\n",
+                             unsupported_desc.c_str());
+                cleanup();
+                return false;
+            }
+            return fallback_to_cpu("Vulkan preflight failed (" + unsupported_desc + ")");
+        }
+
+        gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+        if (!gallocr_) {
+            std::fprintf(stderr, "[-] ReasoningEngine: Failed to create ggml_gallocr\n");
+            return fallback_to_cpu("Vulkan gallocr creation failed");
+        }
+    } catch (const std::exception & e) {
+        return fallback_to_cpu(std::string("Vulkan init exception: ") + e.what());
+    } catch (...) {
+        return fallback_to_cpu("Vulkan init unknown exception");
     }
 
     is_initialized_ = true;
@@ -263,22 +429,115 @@ bool ReasoningEngine::forward_layer(int             local_layer_idx,
     const size_t d_model = static_cast<size_t>(config_.d_model);
     const size_t n_total = n_past + n_tokens;
 
-    ggml_backend_tensor_set(io.H_in, H_in, 0, n_tokens * d_model * sizeof(float));
-    if (io.pos_ids) {
-        ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
-    }
-    if (io.kq_mask) {
-        ggml_backend_tensor_set(io.kq_mask, kq_mask, 0, n_total * n_tokens * sizeof(float));
-    }
+    try {
+        ggml_backend_tensor_set(io.H_in, H_in, 0, n_tokens * d_model * sizeof(float));
+        if (io.pos_ids) {
+            ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
+        }
+        if (io.kq_mask) {
+            ggml_backend_tensor_set(io.kq_mask, kq_mask, 0, n_total * n_tokens * sizeof(float));
+        }
 
-    if (ggml_backend_graph_compute(backend_, io.graph) != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "[-] ReasoningEngine: Graph execution failed at local layer %d (global %d)\n",
+        if (ggml_backend_graph_compute(backend_, io.graph) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[-] ReasoningEngine: Graph execution failed at local layer %d (global %d)\n",
+                         local_layer_idx, layer_range_.start + local_layer_idx);
+            ggml_free(gctx);
+            return false;
+        }
+
+        ggml_backend_tensor_get(io.H_out, H_out, 0, n_tokens * d_model * sizeof(float));
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "[-] ReasoningEngine: Backend exception at local layer %d (global %d): %s\n",
+                     local_layer_idx, layer_range_.start + local_layer_idx, e.what());
+        ggml_free(gctx);
+        return false;
+    } catch (...) {
+        std::fprintf(stderr, "[-] ReasoningEngine: Unknown backend exception at local layer %d (global %d)\n",
                      local_layer_idx, layer_range_.start + local_layer_idx);
         ggml_free(gctx);
         return false;
     }
+    ggml_free(gctx);
+    return true;
+}
 
-    ggml_backend_tensor_get(io.H_out, H_out, 0, n_tokens * d_model * sizeof(float));
+bool ReasoningEngine::forward_vulkan_fused_prefix(int             n_fused,
+                                                  bool            apply_final_norm,
+                                                  const float *   H_in,
+                                                  const int32_t * pos_ids,
+                                                  const float *   kq_mask_f32,
+                                                  size_t          n_tokens,
+                                                  size_t          n_past,
+                                                  float *         H_out) {
+    if (!is_initialized_ || n_fused <= 0 || !H_in || !pos_ids || !H_out || n_tokens == 0) {
+        return false;
+    }
+
+    std::vector<const LayerWeights *> resident_layers;
+    resident_layers.reserve(static_cast<size_t>(n_fused));
+    for (int l = 0; l < n_fused; ++l) {
+        resident_layers.push_back(&weights_.prepare_layer(l));
+    }
+
+    const size_t graph_cap = std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, static_cast<size_t>(n_fused) * 64 + 64);
+    const size_t ctx_bytes = ggml_tensor_overhead() * (static_cast<size_t>(n_fused) * 64 + 64) +
+                             ggml_graph_overhead_custom(graph_cap, /*grads=*/false);
+    struct ggml_context * gctx = ggml_init({ ctx_bytes, nullptr, true });
+    if (!gctx) return false;
+
+    FusedGraphOptions fopts;
+    fopts.use_flash_attn   = vulkan_use_flash_attn_;
+    fopts.use_swiglu       = vulkan_use_swiglu_;
+    fopts.apply_final_norm = apply_final_norm;
+
+    LayerGraphIO io = build_fused_layers_graph(
+        gctx, config_, resident_layers, weights_.get_rope_freqs(),
+        apply_final_norm ? weights_.get_output_norm() : nullptr,
+        kv_cache_, static_cast<int>(n_tokens), static_cast<int>(n_past), fopts);
+
+    if (!ggml_gallocr_alloc_graph(gallocr_, io.graph)) {
+        std::fprintf(stderr, "[-] ReasoningEngine: ggml_gallocr_alloc_graph failed for Vulkan fused graph (%d layers)\n",
+                     n_fused);
+        ggml_free(gctx);
+        return false;
+    }
+    peak_scratch_bytes_ = std::max(peak_scratch_bytes_, ggml_gallocr_get_buffer_size(gallocr_, 0));
+
+    const size_t d_model = static_cast<size_t>(config_.d_model);
+    const size_t n_total = n_past + n_tokens;
+
+    try {
+        ggml_backend_tensor_set(io.H_in,    H_in,    0, n_tokens * d_model * sizeof(float));
+        ggml_backend_tensor_set(io.pos_ids, pos_ids, 0, n_tokens * sizeof(int32_t));
+
+        if (io.kq_mask && kq_mask_f32) {
+            const size_t mask_elems = n_total * n_tokens;
+            if (io.kq_mask->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> mask_f16(mask_elems);
+                ggml_fp32_to_fp16_row(kq_mask_f32, mask_f16.data(), static_cast<int64_t>(mask_elems));
+                ggml_backend_tensor_set(io.kq_mask, mask_f16.data(), 0, mask_elems * sizeof(ggml_fp16_t));
+            } else {
+                ggml_backend_tensor_set(io.kq_mask, kq_mask_f32, 0, mask_elems * sizeof(float));
+            }
+        }
+
+        if (ggml_backend_graph_compute(backend_, io.graph) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[-] ReasoningEngine: Vulkan fused graph execution failed (%d layers)\n", n_fused);
+            ggml_free(gctx);
+            return false;
+        }
+
+        ggml_backend_tensor_get(io.H_out, H_out, 0, n_tokens * d_model * sizeof(float));
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "[-] ReasoningEngine: Vulkan fused graph exception: %s\n", e.what());
+        ggml_free(gctx);
+        return false;
+    } catch (...) {
+        std::fprintf(stderr, "[-] ReasoningEngine: Unknown Vulkan fused graph exception\n");
+        ggml_free(gctx);
+        return false;
+    }
+
     ggml_free(gctx);
     return true;
 }
@@ -304,6 +563,45 @@ bool ReasoningEngine::forward(const float *     H_0,
         return false;
     }
 
+    const bool need_final_norm = layer_range_.should_apply_final_norm(config_.n_layers);
+
+    // Vulkan-only fast path: fuse all consecutive GPU-resident layers (+ final norm if all resident)
+    // into a single graph submission to eliminate per-layer fence waits and CPU<->GPU round-trips.
+    // Hybrid SSM / Gated Attention models, CUDA, Metal, and CPU workflows use forward_layer() below.
+    const int n_vulkan_fused = (backend_kind_ == GpuBackendKind::VULKAN && all_standard_attn_)
+                                   ? weights_.get_n_resident_layers()
+                                   : 0;
+    if (n_vulkan_fused > 0 && n_vulkan_fused == n_local) {
+        std::vector<float> kq_mask;
+        if (n_tokens > 1) {
+            kq_mask.assign(n_total * n_tokens, 0.0f);
+            for (size_t i = 0; i < n_tokens; ++i) {
+                const size_t limit = n_past + i;
+                float * row = kq_mask.data() + i * n_total;
+                for (size_t j = limit + 1; j < n_total; ++j) {
+                    row[j] = -std::numeric_limits<float>::infinity();
+                }
+            }
+        }
+
+        output.H_L.resize(n_tokens * d_model);
+        output.layer_l2_norms.clear();
+
+        if (!forward_vulkan_fused_prefix(n_vulkan_fused, need_final_norm, H_0, pos_ids,
+                                         kq_mask.empty() ? nullptr : kq_mask.data(),
+                                         n_tokens, n_past, output.H_L.data())) {
+            return false;
+        }
+
+        kv_cache_.advance(n_tokens);
+
+        auto t_end        = std::chrono::high_resolution_clock::now();
+        output.n_tokens   = n_tokens;
+        output.d_model    = d_model;
+        output.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        return true;
+    }
+
     // Build causal attention mask [n_total, n_tokens]: j <= n_past + i -> 0.0f, else -INFINITY
     std::vector<float> kq_mask(n_total * n_tokens, 0.0f);
     for (size_t i = 0; i < n_tokens; ++i) {
@@ -317,15 +615,27 @@ bool ReasoningEngine::forward(const float *     H_0,
     // Ping-pong FP32 activation buffers across owned layer slice
     std::vector<float> buf_a(n_tokens * d_model);
     std::vector<float> buf_b(n_tokens * d_model);
-    std::memcpy(buf_a.data(), H_0, n_tokens * d_model * sizeof(float));
 
     std::vector<float> * H_curr = &buf_a;
     std::vector<float> * H_next = &buf_b;
 
-    output.layer_l2_norms.resize(n_local);
+    int start_layer = 0;
+    if (n_vulkan_fused > 0) {
+        // Hybrid Vulkan streaming: fuse resident prefix [0 .. n_vulkan_fused), then stream remainder
+        if (!forward_vulkan_fused_prefix(n_vulkan_fused, /*apply_final_norm=*/false, H_0, pos_ids,
+                                         kq_mask.data(), n_tokens, n_past, buf_a.data())) {
+            return false;
+        }
+        start_layer = n_vulkan_fused;
+        output.layer_l2_norms.assign(n_local, 0.0f);
+    } else {
+        std::memcpy(buf_a.data(), H_0, n_tokens * d_model * sizeof(float));
+        output.layer_l2_norms.resize(n_local);
+    }
+
     const size_t last_token_off = (n_tokens - 1) * d_model;
 
-    for (int local_l = 0; local_l < n_local; ++local_l) {
+    for (int local_l = start_layer; local_l < n_local; ++local_l) {
         if (!forward_layer(local_l, H_curr->data(), pos_ids, kq_mask.data(),
                            n_tokens, n_past, H_next->data())) {
             return false;
@@ -335,7 +645,7 @@ bool ReasoningEngine::forward(const float *     H_0,
     }
 
     // Apply final output_norm only if this node owns the tail (or apply_final_norm == 1)
-    if (layer_range_.should_apply_final_norm(config_.n_layers)) {
+    if (need_final_norm) {
         output.H_L.resize(n_tokens * d_model);
         const size_t final_ctx_bytes = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
         struct ggml_context * gctx = ggml_init({ final_ctx_bytes, nullptr, true });
@@ -348,12 +658,22 @@ bool ReasoningEngine::forward(const float *     H_0,
             ggml_free(gctx);
             return false;
         }
-        ggml_backend_tensor_set(f_io.H_in, H_curr->data(), 0, H_curr->size() * sizeof(float));
-        if (ggml_backend_graph_compute(backend_, f_io.graph) != GGML_STATUS_SUCCESS) {
+        try {
+            ggml_backend_tensor_set(f_io.H_in, H_curr->data(), 0, H_curr->size() * sizeof(float));
+            if (ggml_backend_graph_compute(backend_, f_io.graph) != GGML_STATUS_SUCCESS) {
+                ggml_free(gctx);
+                return false;
+            }
+            ggml_backend_tensor_get(f_io.H_out, output.H_L.data(), 0, output.H_L.size() * sizeof(float));
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "[-] ReasoningEngine: Backend exception in final RMSNorm: %s\n", e.what());
+            ggml_free(gctx);
+            return false;
+        } catch (...) {
+            std::fprintf(stderr, "[-] ReasoningEngine: Unknown backend exception in final RMSNorm\n");
             ggml_free(gctx);
             return false;
         }
-        ggml_backend_tensor_get(f_io.H_out, output.H_L.data(), 0, output.H_L.size() * sizeof(float));
         ggml_free(gctx);
     } else {
         output.H_L = std::move(*H_curr);

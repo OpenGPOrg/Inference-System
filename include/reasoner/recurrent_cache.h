@@ -26,6 +26,7 @@ public:
 
     // Zero-initializes all conv1d and DeltaNet recurrent states (e.g., on new turn/conversation)
     void reset();
+    void release() { cleanup(); }
 
     struct ggml_tensor * get_conv_state(int local_layer_idx) const;
     struct ggml_tensor * get_ssm_state(int local_layer_idx) const;

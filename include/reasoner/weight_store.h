@@ -83,6 +83,7 @@ public:
 
     // Returns layer weights ready for compute on `backend` (local_layer_idx in [0 .. get_n_local_layers() - 1])
     const LayerWeights & prepare_layer(int local_layer_idx);
+    void release() { cleanup(); }
 
     std::vector<LayerKind> get_layer_kinds() const;
 

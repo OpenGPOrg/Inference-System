@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "reasoner/backend_selector.h"
 #include "reasoner/model_config.h"
 #include "reasoner/weight_store.h"
 #include "reasoner/kv_cache.h"
@@ -82,6 +83,8 @@ public:
     const RecurrentStateCache & get_recurrent_cache() const { return recurrent_cache_; }
 
     bool               is_gpu_active() const { return is_gpu_; }
+    bool               is_igpu_active() const { return is_igpu_; }
+    GpuBackendKind     get_backend_kind() const { return backend_kind_; }
     const std::string & get_backend_name() const { return backend_name_; }
     int                get_active_threads() const { return active_threads_; }
     size_t             get_ctx_size() const { return active_ctx_size_; }
@@ -90,7 +93,19 @@ public:
 private:
     void cleanup();
 
+    bool initialize_impl(const std::string &      gguf_filepath,
+                         const ReasoningOptions & options,
+                         bool                     allow_vulkan_fallback);
     bool init_backend();
+    bool preflight_vulkan_ops(std::string & unsupported_desc);
+    bool forward_vulkan_fused_prefix(int             n_fused,
+                                     bool            apply_final_norm,
+                                     const float *   H_in,
+                                     const int32_t * pos_ids,
+                                     const float *   kq_mask_f32,
+                                     size_t          n_tokens,
+                                     size_t          n_past,
+                                     float *         H_out);
 
     ReasoningOptions options_;
     ModelConfig      config_;
@@ -98,10 +113,15 @@ private:
 
     struct gguf_context * gctx_ = nullptr;
 
-    ggml_backend_t backend_        = nullptr;
-    ggml_gallocr_t gallocr_        = nullptr;
-    bool           is_gpu_         = false;
-    int            active_threads_ = 1;
+    ggml_backend_t backend_               = nullptr;
+    ggml_gallocr_t gallocr_               = nullptr;
+    GpuBackendKind backend_kind_          = GpuBackendKind::NONE;
+    bool           is_gpu_                = false;
+    bool           is_igpu_               = false;
+    bool           all_standard_attn_     = true;
+    bool           vulkan_use_flash_attn_ = false;
+    bool           vulkan_use_swiglu_     = false;
+    int            active_threads_        = 1;
     std::string    backend_name_;
 
     WeightStore         weights_;

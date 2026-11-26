@@ -36,7 +36,7 @@ void print_usage(const char * prog) {
               << "Execution & Memory:\n"
               << "  --device auto|gpu|cpu    Reasoning device preference (default: auto)\n"
               << "  --lm-head auto|gpu|cpu   LM Head placement (default: auto)\n"
-              << "  --gpu-id <id>            CUDA device index (default: 0)\n"
+              << "  --gpu-id <id>            GPU device index (default: auto; CUDA or Vulkan)\n"
               << "  --threads <N>            CPU threads (default: 0 = auto)\n"
               << "  --kv-precision f16|f32   KV cache precision (default: f16)\n"
               << "  --ctx-size <N>           Fixed context window size (default: 512; halved on init if VRAM low)\n"
@@ -283,7 +283,10 @@ int main(int argc, char ** argv) {
         std::cout << " (100% Host mmap, "
                   << std::setprecision(1) << (ws.get_total_weight_bytes() / (1024.0 * 1024.0)) << " MB)";
     }
-    std::cout << "\n[KV Cache]   Memory : " << (reasoning.is_gpu_active() ? "Device VRAM" : "Host RAM")
+    const char * kv_mem_label = !reasoning.is_gpu_active()
+        ? "Host RAM"
+        : (reasoning.is_igpu_active() ? "GPU Shared Memory" : "GPU VRAM");
+    std::cout << "\n[KV Cache]   Memory : " << kv_mem_label
               << " | allocated=" << std::setprecision(2) << (kv.total_bytes() / (1024.0 * 1024.0))
               << " MB (ctx=" << kv.get_capacity() << " tokens, "
               << kv.get_n_attn_layers() << " attn layers, "

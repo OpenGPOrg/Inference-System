@@ -12,8 +12,8 @@ namespace opengp {
 namespace responder {
 
 enum class LmHeadDevice {
-    AUTO, // Use CUDA GPU if weight fits in remaining free VRAM with headroom, else CPU mmap
-    GPU,  // Force CUDA GPU
+    AUTO, // Use GPU (CUDA/Metal/discrete Vulkan) if weight fits in free VRAM with headroom, else CPU mmap
+    GPU,  // Force GPU backend
     CPU   // Force multi-threaded Host mmap CPU (0 VRAM)
 };
 
@@ -29,7 +29,7 @@ public:
     // Memory-map output.weight (fallback token_embd.weight for tied embeddings) and allocate compute graph once
     bool init(const std::string & gguf_filepath,
               LmHeadDevice        device_pref   = LmHeadDevice::AUTO,
-              int                 gpu_device_id = 0,
+              int                 gpu_device_id = -1,
               int                 n_threads     = 0);
 
     // Project a single hidden state vector [d_model] -> FP32 logits [vocab_size]

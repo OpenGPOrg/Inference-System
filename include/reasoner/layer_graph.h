@@ -6,6 +6,8 @@
 #include "reasoner/kv_cache.h"
 #include "reasoner/recurrent_cache.h"
 
+#include <vector>
+
 namespace opengp {
 namespace reasoner {
 
@@ -39,6 +41,26 @@ FinalNormGraphIO build_final_norm_graph(struct ggml_context *      ctx,
                                         const ModelConfig &        cfg,
                                         const struct ggml_tensor * output_norm,
                                         int                        n_tokens);
+
+// Options for multi-layer fused graph construction (used exclusively by Vulkan backend)
+struct FusedGraphOptions {
+    bool use_flash_attn   = false; // Use ggml_flash_attn_ext (eliminates V transpose + KQ buffer)
+    bool use_swiglu       = false; // Use fused ggml_swiglu_split instead of silu + mul
+    bool apply_final_norm = false; // Fuse output_norm RMSNorm at the tail of the graph
+};
+
+// Build a single computation graph chaining consecutive GPU-resident layers [0 .. layers.size()-1]
+// (+ optional final RMSNorm). When n_tokens == 1, io.kq_mask is nullptr (no causal masking needed).
+// When n_tokens > 1, io.kq_mask is GGML_TYPE_F16 if use_flash_attn else GGML_TYPE_F32.
+LayerGraphIO build_fused_layers_graph(struct ggml_context *              ctx,
+                                      const ModelConfig &                cfg,
+                                      const std::vector<const LayerWeights *> & layers,
+                                      const struct ggml_tensor *         rope_freqs,
+                                      const struct ggml_tensor *         output_norm,
+                                      KVCache &                          kv,
+                                      int                                n_tokens,
+                                      int                                n_past,
+                                      const FusedGraphOptions &          opts);
 
 } // namespace reasoner
 } // namespace opengp

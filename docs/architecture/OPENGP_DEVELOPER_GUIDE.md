@@ -45,7 +45,7 @@ flowchart TD
 
     H0 --> P2
 
-    subgraph P2["Phase 2: Reasoner (CUDA GPU Hybrid VRAM/mmap or Multi-Threaded CPU)"]
+    subgraph P2["Phase 2: Reasoner (GPU CUDA/Metal/Vulkan Hybrid VRAM/mmap or Multi-Threaded CPU)"]
         L0["Transformer Layer 0"] --> L1["Transformer Layer 1"]
         L1 --> LD["... Transformer Layer L-1"]
         KV[("Pre-Allocated Fixed KV Cache\n[n_local_layers, K/V, ctx_size]")]
@@ -58,7 +58,7 @@ flowchart TD
 
     HN -->|"Slice last row: H_n[n_tokens - 1]"| P3
 
-    subgraph P3["Phase 3: Responder (CUDA GPU or CPU mmap LM Head)"]
+    subgraph P3["Phase 3: Responder (GPU or CPU mmap LM Head)"]
         LM["LmHead::project() -> logits [vocab_size]"] --> SM["Sampler::sample() -> token_id"]
         SM --> EOT{"In eot_token_ids\nor ctx_limit?"}
         EOT -- "No" --> DT["Detokenizer::push_token() -> UTF-8 Stream stdout"]
@@ -171,9 +171,9 @@ Key architectural behaviors in the computation graph:
 
 ## 2.1 Core Architectural Principles
 
-1. **100% Self-Contained Repository:** All GGML, GGUF, CPU SIMD (`arch/x86`, `arch/arm`), CUDA (`vendor/ggml/src/ggml-cuda`), and Apple Metal (`vendor/ggml/src/ggml-metal`) kernels are vendored in-tree under `opengp/vendor/ggml/`. Zero external `llama.cpp` or parent-directory dependencies.
+1. **100% Self-Contained Repository:** All GGML, GGUF, CPU SIMD (`arch/x86`, `arch/arm`), CUDA (`vendor/ggml/src/ggml-cuda`), Apple Metal (`vendor/ggml/src/ggml-metal`), and Vulkan (`vendor/ggml/src/ggml-vulkan`, including vendored `spirv.hpp`) kernels are vendored in-tree under `opengp/vendor/ggml/`. Zero external `llama.cpp` or parent-directory dependencies.
 2. **Model-Agnostic Dynamic Discovery:** Zero hardcoded model names, dimensions, stop IDs, or RoPE constants. Every hyperparameter and tensor layout is driven dynamically by GGUF metadata (`general.architecture`, `<arch>.*`) and tensor lookup.
-3. **Hardware Portability (GPU-First with Automatic CPU Fallback):** Automatically initializes NVIDIA CUDA (`OPENGP_HAS_CUDA=1`) or Apple Metal (`OPENGP_HAS_METAL=1`) when present and seamlessly falls back to multi-threaded CPU (`ggml_backend_cpu_init`) on CPU-only systems.
+3. **Hardware Portability (GPU-First with Automatic CPU Fallback):** Runtime priority is **CUDA → Metal → Vulkan → CPU**. Automatically initializes NVIDIA CUDA (`OPENGP_HAS_CUDA=1`), Apple Metal (`OPENGP_HAS_METAL=1`), or Vulkan (`OPENGP_HAS_VULKAN=1`, for AMD/Intel dGPUs and iGPUs) when present. Vulkan runs a startup smoke test against CPU and an op-support preflight on the real layer graph, logging and seamlessly falling back to multi-threaded CPU (`ggml_backend_cpu_init`) on any driver/hardware/op failure or when `OPENGP_DISABLE_VULKAN=1` is set.
 4. **Deterministic Memory Budgeting:** Allocates fixed KV Cache up front (default `512`, auto-halving on init if VRAM is tight), then pins as many Transformer layers as fit in remaining VRAM while streaming overflow layers over a single reusable GPU staging buffer from zero-copy Host `mmap`.
 
 ---
@@ -182,20 +182,22 @@ Key architectural behaviors in the computation graph:
 
 ```text
 opengp/
-├── CMakeLists.txt                       # Builds ggml/ggml-cuda + all 3 phase libs + 3 CLIs
-├── Makefile                             # Developer wrapper (`make clean` preserves vendor GGML/CUDA)
+├── CMakeLists.txt                       # Builds ggml (+ optional CUDA/Metal/Vulkan) + 3 phase libs + 3 CLIs
+├── Makefile                             # Developer wrapper (`make clean` preserves vendor GGML/CUDA/Vulkan)
 ├── README.md
 ├── docs/
 │   └── architecture/
 │       └── OPENGP_DEVELOPER_GUIDE.md    # This guide
 ├── models/                              # Local .gguf files (gitignored)
-├── vendor/ggml/                         # In-tree GGML, GGUF, CPU SIMD & CUDA backends
+├── vendor/ggml/                         # In-tree GGML, GGUF, CPU SIMD, CUDA, Metal & Vulkan backends
 │   ├── CMakeLists.txt
-│   ├── include/                         # ggml.h, gguf.h, ggml-backend.h, ggml-cuda.h, ...
+│   ├── include/                         # ggml.h, gguf.h, ggml-backend.h, ggml-cuda.h, ggml-metal.h, ggml-vulkan.h, ...
 │   └── src/
 │       ├── ggml.c, gguf.cpp, ggml-alloc.c, ggml-backend*.cpp, ggml-quants.c
 │       ├── ggml-cpu/                    # AVX/AVX2/AVX512/NEON/AMX kernels
-│       └── ggml-cuda/                   # Vendored CUDA & FlashAttention kernels
+│       ├── ggml-cuda/                   # Vendored CUDA & FlashAttention kernels
+│       ├── ggml-metal/                  # Vendored Apple Metal kernels (embedded on macOS)
+│       └── ggml-vulkan/                 # Vendored Vulkan compute shaders (AMD/Intel/iGPU)
 ├── include/
 │   ├── perception/                      # Phase 1 public headers
 │   │   ├── tokenizer_config.h
@@ -206,6 +208,7 @@ opengp/
 │   │   ├── embed_table.h
 │   │   └── perception_pipeline.h
 │   ├── reasoner/                        # Phase 2 public headers
+│   │   ├── backend_selector.h
 │   │   ├── model_config.h
 │   │   ├── weight_store.h
 │   │   ├── kv_cache.h
@@ -244,8 +247,9 @@ opengp/
 | **`ModelConfig` & `ReasoningOptions`** ([model_config.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/reasoner/model_config.h)) | Reads `<arch>.*` GGUF dimensions, attention ratios, RoPE base/mode (`NORM`/`NEOX`), and stores user options (`device`, `ctx_size=512`, `kv_precision`, `vram_utilization`, `layers`). | `LayerRange`, `ReasoningOptions`, `ModelConfig::load_from_gguf()` |
 | **`WeightStore`** ([weight_store.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/reasoner/weight_store.h)) | Maps GGUF tensors read-only via `mmap`, resolves `blk.<global_l>.*` only for `[range.start .. range.end)`, and manages GPU-resident + single-layer `ggml_tallocr` staging buffers. | `LayerWeights`, `WeightStore::init()`, `prepare_layer(local_l)` |
 | **`KVCache`** ([kv_cache.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/reasoner/kv_cache.h)) | Allocates fixed `k_layers_[l]` and `v_layers_[l]` (`[d_head * n_kv_heads, capacity]`) for `n_local_layers`, exposing zero-copy write/read graph views. | `init()`, `allocate(cap)`, `write_view_k/v()`, `read_view_k/v()`, `advance()`, `reset()` |
-| **`LayerGraphBuilder`** ([layer_graph.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/reasoner/layer_graph.h)) | Emits the GGML computation graph for one Transformer block (`RMSNorm -> QKV -> QK-Norm -> RoPE -> KV write -> Causal GQA/MHA -> Wo -> Res1 -> FFN RMSNorm -> SwiGLU -> Res2`) and final `output_norm`. | `build_layer_graph()`, `build_final_norm_graph()` |
-| **`ReasoningEngine`** ([reasoner_engine.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/reasoner/reasoner_engine.h)) | Selects CUDA or CPU backend, auto-halves `ctx_size` at init if memory is tight, plans `WeightStore`, reuses a single `ggml_gallocr_t`, and runs layer-by-layer execution + `ActivationPacket` handoffs. | `initialize()`, `forward()`, `forward_layer()`, `forward_packet()`, `reset_kv_cache()` |
+| **`LayerGraphBuilder`** ([layer_graph.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/reasoner/layer_graph.h)) | Emits the GGML computation graph for one Transformer block (`RMSNorm -> QKV -> QK-Norm -> RoPE -> KV write -> Causal GQA/MHA -> Wo -> Res1 -> FFN RMSNorm -> SwiGLU -> Res2`), final `output_norm`, and a Vulkan-only multi-layer fused graph (`build_fused_layers_graph`) with optional `ggml_flash_attn_ext` and fused `ggml_swiglu_split`. | `build_layer_graph()`, `build_final_norm_graph()`, `build_fused_layers_graph()` |
+| **`BackendSelector`** (`backend_selector.h`) | Shared GPU discovery following CUDA → Metal → Vulkan priority; skips software rasterizers (`llvmpipe`/`lavapipe`/`SwiftShader`), caches a startup Vulkan-vs-CPU numerical smoke test, runs a cached ~9 MB `Q4_K` matvec micro-benchmark for Vulkan iGPUs in `AUTO` mode (falling back to CPU unless the iGPU beats CPU by ≥10%; bypassed when `--device gpu` is explicit), and honors `OPENGP_DISABLE_VULKAN=1`. | `GpuBackendKind`, `GpuBackendSelection`, `select_gpu_backend()` |
+| **`ReasoningEngine`** (`reasoner_engine.h`) | Selects GPU or CPU backend via `select_gpu_backend()`, applies shared-memory caps on Vulkan iGPUs, preflights Vulkan op support with automatic CPU re-init on failure, auto-halves `ctx_size` if memory is tight, plans `WeightStore`, reuses a single `ggml_gallocr_t`, and runs layer-by-layer execution + `ActivationPacket` handoffs. | `initialize()`, `forward()`, `forward_layer()`, `forward_packet()`, `reset_kv_cache()` |
 
 ---
 
@@ -253,7 +257,7 @@ opengp/
 
 | Class / File | Responsibility | Key Types & Methods |
 | :--- | :--- | :--- |
-| **`LmHead`** ([lm_head.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/responder/lm_head.h)) | Maps `output.weight` (or tied `token_embd.weight`), auto-places on CUDA GPU if free VRAM > weight + 256 MB else CPU `mmap`, caches a persistent projection graph. | `LmHeadDevice`, `init()`, `project()` |
+| **`LmHead`** (`lm_head.h`) | Maps `output.weight` (or tied `token_embd.weight`), auto-places on GPU (CUDA/Metal/Vulkan, with a 50% shared-memory cap on Vulkan iGPUs and op-support preflight) if free memory > weight + 256 MB else CPU `mmap`, caches a persistent projection graph. | `LmHeadDevice`, `init()`, `project()` |
 | **`Sampler`** ([sampler.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/responder/sampler.h)) | Applies repetition penalty, greedy fast-path, temperature, Top-K, stable Softmax, Min-P, Top-P, and PRNG draw. | `SamplerConfig`, `configure()`, `sample()` |
 | **`Detokenizer`** ([detokenizer.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/responder/detokenizer.h)) | Streaming Byte-BPE & SentencePiece Unigram decoder with partial multi-byte UTF-8 buffering. | `init()`, `push_token()`, `flush()`, `reset()` |
 | **`RespondingEngine`** ([responder_engine.h](file:///media/vithurshan/vithu/opengp/ggml/opengp/include/responder/responder_engine.h)) | Combines `LmHead`, `Sampler`, `Detokenizer`, and dynamic `eot_token_ids` checking. | `initialize()`, `sample_next()`, `is_stop_token()`, `decode_token()`, `flush()` |
@@ -267,6 +271,7 @@ OpenGP uses a **KV-First Memory Budgeting** strategy inside `ReasoningEngine::in
 1. **Before KV Allocation:** Reserves minimum non-KV headroom (`512 MB`) so at least 1 staging layer + compute scratch always fit. If `bytes_per_token * ctx_size` exceeds available budget (or `allocate()` fails), `ctx_size` is **halved by 2** (`target_ctx /= 2`) during init and logged.
 2. **After KV Allocation:** Queries actual remaining free VRAM (`usable = free_vram * vram_utilization - 256 MB scratch reserve`), pins layers `0 .. R-1` permanently in `resident_buf_`, and streams remaining layers `R .. L-1` from OS `mmap` page cache into one reusable `stage_buf_`.
 3. **After Reasoning Init:** `LmHead` inspects remaining free VRAM; if `free_vram > lm_head_bytes + 256 MB`, `output.weight` is placed on GPU, otherwise it stays in zero-copy Host `mmap` (`CPU mmap`).
+4. **Vulkan Integrated GPUs (UMA Shared Memory):** On integrated GPUs (e.g., Intel UHD/Iris, AMD Radeon Graphics), Vulkan memory heaps reflect shared system RAM already used by the OS and `mmap` page cache. OpenGP automatically detects `GGML_BACKEND_DEVICE_TYPE_IGPU` and caps the usable GPU budget to `min(free * vram_utilization, 50% of reported free)` for both `ReasoningEngine` and `LmHead` so the system remains responsive without OOM pressure.
 
 ### Measured Memory Map (`baronllm-llama3.1-v1-q6_k.gguf` on RTX 3060 5,806 MiB VRAM)
 
@@ -306,12 +311,26 @@ GPU VRAM (RTX 3060 — 5,806 MiB)                        Host RAM (Zero-Copy mma
 
 ## 2.8 Build System & Developer Workflows
 
-- **CMake ([CMakeLists.txt](file:///media/vithurshan/vithu/opengp/ggml/opengp/CMakeLists.txt) & [vendor/ggml/CMakeLists.txt](file:///media/vithurshan/vithu/opengp/ggml/opengp/vendor/ggml/CMakeLists.txt)):**
-  - Automatically detects `CUDAToolkit` (`OPENGP_HAS_CUDA=1`) and macOS Metal frameworks (`OPENGP_HAS_METAL=1` with embedded `.metal` shaders), or builds CPU-only with native SIMD (`-march=native`) otherwise.
+- **CMake (`CMakeLists.txt` & `vendor/ggml/CMakeLists.txt`):**
+  - Automatically detects `CUDAToolkit` (`OPENGP_HAS_CUDA=1`), macOS Metal frameworks (`OPENGP_HAS_METAL=1` with embedded `.metal` shaders), and Vulkan (`OPENGP_HAS_VULKAN=1`, skipped in `AUTO` when CUDA or macOS is active; requires Vulkan SDK/headers + `vulkan/vulkan.hpp` + `glslc`), or builds CPU-only with native SIMD (`-march=native`) otherwise. Missing Vulkan dependencies soft-fail cleanly without aborting configuration.
+  - CMake cache options: `-DOPENGP_CUDA=ON|OFF`, `-DOPENGP_METAL=ON|OFF`, `-DOPENGP_VULKAN=AUTO|ON|OFF`.
+  - **Prerequisites for AMD & Intel GPUs (Cross-Platform Driver & Build Setup):**
+    - **Ubuntu / Debian:**
+      - *Runtime only:* `sudo apt install -y libvulkan1 mesa-vulkan-drivers`
+      - *Building from source:* `sudo apt install -y libvulkan-dev glslc`
+    - **Arch Linux / Manjaro:**
+      - *Runtime only:* `sudo pacman -S vulkan-icd-loader vulkan-intel` (Intel) or `vulkan-radeon` (AMD)
+      - *Building from source:* `sudo pacman -S vulkan-headers shaderc`
+    - **Fedora / RHEL:**
+      - *Runtime only:* `sudo dnf install -y vulkan-loader mesa-vulkan-drivers`
+      - *Building from source:* `sudo dnf install -y vulkan-headers glslc`
+    - **Windows:**
+      - Standard Intel Arc/UHD Graphics drivers or AMD Adrenalin drivers provide `vulkan-1.dll` in system paths automatically.
+    - **Diagnosis:** Run `vulkaninfo --summary` to verify that ICD drivers are active and enumerating devices.
   - Compiles static core libraries `opengp_perception_core`, `opengp_reasoner_core`, `opengp_responder_core` and 3 executables: `opengp_perception`, `opengp_reasoner`, `opengp_infer`.
-- **Incremental `Makefile` ([Makefile](file:///media/vithurshan/vithu/opengp/ggml/opengp/Makefile)):**
+- **Incremental `Makefile` (`Makefile`):**
   - `make` — Configures (if needed) and builds all targets in Release mode using all CPU cores.
-  - `make clean` — Deletes **only** OpenGP `.o`, `libopengp_*.a`, and binaries while **preserving compiled `build/vendor/` (`libggml-cuda.a`, `libggml.a`)**, reducing clean rebuilds from minutes to ~3 seconds.
+  - `make clean` — Deletes **only** OpenGP `.o`, `libopengp_*.a`, and binaries while **preserving compiled `build/vendor/` (`libggml-cuda.a`, `libggml-vulkan.a`, `libggml.a`)**, reducing clean rebuilds from minutes to seconds.
   - `make distclean` — Wipes the entire `build/` directory including vendor artifacts.
 
 ---
@@ -337,6 +356,18 @@ GPU VRAM (RTX 3060 — 5,806 MiB)                        Host RAM (Zero-Copy mma
 | **`stories15M.gguf`** | `F32` / `llama` (MHA 6/6) | `6` GPU resident + GPU `lm_head` | `231.8 tok/s` | **`473.89 tok/s`** |
 | **`baronllm-llama3.1-v1-q6_k.gguf`** | `Q6_K` / `llama` (GQA 32/8) | `23` GPU resident, `9` streamed + GPU `lm_head` | `6.3–56.0 tok/s` | **`3.28–3.84 tok/s`** |
 | **`Qwen3-8B-Q8_0.gguf`** | `Q8_0` / `qwen3` (GQA 32/8 + QK-Norm) | `20` GPU resident, `16` streamed + GPU `lm_head` | `7.9 tok/s` | **`1.88 tok/s`** |
+
+### Verified Benchmarks (Intel UHD Graphics CometLake-U GT2 iGPU vs. 4-Thread CPU, 8 GB RAM)
+
+Measured via `./scripts/benchmark_igpu_vs_cpu.sh --iterations 10 --threads 4` (warm Mesa shader cache, 10-iteration averages, `--device gpu --lm-head gpu` vs. `--device cpu --lm-head cpu`):
+
+| Model | Quant / Params | Max Decode | Vulkan iGPU Prefill / Decode | CPU (4T) Prefill / Decode | iGPU / CPU Ratio |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`qwen2-0_5b-instruct-q4_0.gguf`** | `Q4_0` / 0.5B | 48 tok | `78.84` / `11.98 tok/s` | `60.82` / `16.63 tok/s` | `1.30x` prefill / `0.72x` decode |
+| **`qwen2.5-1.5b-instruct-q4_k_m.gguf`** | `Q4_K_M` / 1.5B | 100 tok | `24.94` / `8.15 tok/s` | `52.70` / `14.09 tok/s` | `0.47x` prefill / `0.58x` decode |
+| **`Qwen3-4B-Q4_K_M.gguf`** | `Q4_K_M` / 4B | 100 tok | `9.76` / `3.48 tok/s` | `20.10` / `5.77 tok/s` | `0.49x` prefill / `0.60x` decode |
+
+*Takeaway & Auto-Calibration Policy:* Entry-level iGPUs like Intel UHD 620 (24 EUs, shared DDR4, no integer dot-product or matrix cores) trail an AVX2 multi-core CPU on `Q4_K_M` workloads. Fusing all consecutive Vulkan-resident layers (+ final `output_norm`) into a single graph submission with `ggml_flash_attn_ext` (zero-mask decode, no V-cache transpose copy) and `ggml_swiglu_split` eliminates per-layer Vulkan fence stalls and boosts Vulkan decode up to **+73%** (`qwen2-0.5b`: `12.0 → 20.7 tok/s`; `qwen2.5-1.5b`: `8.15 → 8.91 tok/s`; `Qwen3-4B`: `3.48 → 3.62 tok/s`, approaching the UHD 620 hardware ceiling while keeping CUDA, Metal, and CPU workflows untouched). Rather than hardcoding GPU model lists, `select_gpu_backend()` automatically runs a brief cached ~9 MB `Q4_K` matvec micro-benchmark when only a Vulkan iGPU is present in `AUTO` mode: faster modern iGPUs (e.g., AMD Radeon 780M/890M, Intel Arc iGPU) auto-enable when they beat CPU by ≥10%, while weaker iGPUs log the comparison and stay on CPU (explicit `--device gpu` always overrides the speed gate). Discrete Vulkan GPUs skip the iGPU gate and enable automatically. Three-stage pipeline parity (`--verify-pipeline 3`) on Vulkan matches monolithic execution bit-for-bit (`Cosine Similarity = 1.0000000`, `Max Abs Diff = 0.000e+00`).
 
 ---
 

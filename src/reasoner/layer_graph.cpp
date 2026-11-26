@@ -1,5 +1,6 @@
 #include "reasoner/layer_graph.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace opengp {
@@ -269,6 +270,134 @@ FinalNormGraphIO build_final_norm_graph(struct ggml_context *      ctx,
     ggml_set_output(io.H_out);
 
     io.graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(io.graph, io.H_out);
+    return io;
+}
+
+LayerGraphIO build_fused_layers_graph(struct ggml_context *                     ctx,
+                                      const ModelConfig &                       cfg,
+                                      const std::vector<const LayerWeights *> & layers,
+                                      const struct ggml_tensor *                rope_freqs,
+                                      const struct ggml_tensor *                output_norm,
+                                      KVCache &                                 kv,
+                                      int                                       n_tokens,
+                                      int                                       n_past,
+                                      const FusedGraphOptions &                 opts) {
+    LayerGraphIO io;
+    const int    n_total = n_past + n_tokens;
+    const size_t n_fused = layers.size();
+
+    io.H_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.d_model, n_tokens);
+    ggml_set_name(io.H_in, "H_in");
+    ggml_set_input(io.H_in);
+
+    io.pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(io.pos_ids, "pos_ids");
+    ggml_set_input(io.pos_ids);
+
+    // For single-token decode (n_tokens == 1), all [0 .. n_past] positions are unmasked (mask = nullptr)
+    if (n_tokens > 1) {
+        const enum ggml_type mask_type = opts.use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        io.kq_mask = ggml_new_tensor_2d(ctx, mask_type, n_total, n_tokens);
+        ggml_set_name(io.kq_mask, "kq_mask");
+        ggml_set_input(io.kq_mask);
+    }
+
+    const size_t graph_cap = std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, n_fused * 64 + 64);
+    io.graph = ggml_new_graph_custom(ctx, graph_cap, /*grads=*/false);
+
+    struct ggml_tensor * rf    = const_cast<struct ggml_tensor *>(rope_freqs);
+    const float          scale = 1.0f / std::sqrt(static_cast<float>(cfg.d_head_k));
+    struct ggml_tensor * H_cur = io.H_in;
+
+    for (size_t l = 0; l < n_fused; ++l) {
+        const LayerWeights & w         = *layers[l];
+        const int            layer_idx = static_cast<int>(l);
+
+        // 1. Pre-Attention RMSNorm
+        struct ggml_tensor * cur = rms_norm_weighted(ctx, H_cur, w.attn_norm, cfg.rms_norm_eps);
+
+        // 2. Q, K, V linear projections
+        struct ggml_tensor * Q = linear_proj(ctx, cur, w.wq, w.bq);
+        struct ggml_tensor * K = linear_proj(ctx, cur, w.wk, w.bk);
+        struct ggml_tensor * V = linear_proj(ctx, cur, w.wv, w.bv);
+
+        // 3. Head slicing + optional per-head QK-Norm
+        Q = ggml_reshape_3d(ctx, Q, cfg.d_head_k, cfg.n_heads, n_tokens);
+        K = ggml_reshape_3d(ctx, K, cfg.d_head_k, cfg.n_kv_heads, n_tokens);
+
+        if (w.attn_q_norm) {
+            Q = rms_norm_weighted(ctx, Q, w.attn_q_norm, cfg.rms_norm_eps);
+        }
+        if (w.attn_k_norm) {
+            K = rms_norm_weighted(ctx, K, w.attn_k_norm, cfg.rms_norm_eps);
+        }
+
+        // 4. Rotary Position Embedding on Q and K
+        Q = ggml_rope_ext(ctx, Q, io.pos_ids, rf, cfg.rope_dim, cfg.rope_mode, 0,
+                          cfg.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx, K, io.pos_ids, rf, cfg.rope_dim, cfg.rope_mode, 0,
+                          cfg.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // 5. Append K and V into persistent KV Cache (expanded strictly before attention reads)
+        struct ggml_tensor * K_flat = ggml_reshape_2d(
+            ctx, K, static_cast<int64_t>(cfg.d_head_k) * cfg.n_kv_heads, n_tokens);
+        ggml_build_forward_expand(
+            io.graph, ggml_cpy(ctx, K_flat, kv.write_view_k(ctx, layer_idx, n_past, n_tokens)));
+        ggml_build_forward_expand(
+            io.graph, ggml_cpy(ctx, V, kv.write_view_v(ctx, layer_idx, n_past, n_tokens)));
+
+        // 6. Scaled Dot-Product Causal Attention
+        struct ggml_tensor * Q_perm = ggml_permute(ctx, Q, 0, 2, 1, 3); // [d_head_k, n_tokens, n_heads]
+        struct ggml_tensor * K_all  = ggml_permute(
+            ctx, kv.read_view_k(ctx, layer_idx, n_total), 0, 2, 1, 3); // [d_head_k, n_total, n_kv_heads]
+
+        struct ggml_tensor * KQV_merged = nullptr;
+        if (opts.use_flash_attn) {
+            struct ggml_tensor * V_all = ggml_permute(
+                ctx, kv.read_view_v(ctx, layer_idx, n_total), 0, 2, 1, 3); // [d_head_v, n_total, n_kv_heads]
+            struct ggml_tensor * KQV = ggml_flash_attn_ext(
+                ctx, Q_perm, K_all, V_all, io.kq_mask, scale, 0.0f, 0.0f); // [d_head_v, n_heads, n_tokens]
+            KQV_merged = ggml_reshape_2d(
+                ctx, KQV, static_cast<int64_t>(cfg.d_head_v) * cfg.n_heads, n_tokens);
+        } else {
+            struct ggml_tensor * KQ      = ggml_mul_mat(ctx, K_all, Q_perm);
+            struct ggml_tensor * KQ_soft = ggml_soft_max_ext(ctx, KQ, io.kq_mask, scale, 0.0f);
+            struct ggml_tensor * V_all   = ggml_cont(
+                ctx, ggml_permute(ctx, kv.read_view_v(ctx, layer_idx, n_total), 1, 2, 0, 3));
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx, V_all, KQ_soft);
+            KQV_merged = ggml_cont_2d(
+                ctx,
+                ggml_permute(ctx, KQV, 0, 2, 1, 3),
+                static_cast<int64_t>(cfg.d_head_v) * cfg.n_heads,
+                n_tokens);
+        }
+
+        // 7. Output projection + Residual 1
+        struct ggml_tensor * attn_out = linear_proj(ctx, KQV_merged, w.wo, w.bo);
+        struct ggml_tensor * H_mid    = ggml_add(ctx, H_cur, attn_out);
+
+        // 8. Post-Attention RMSNorm + SwiGLU FFN
+        struct ggml_tensor * ffn_in    = rms_norm_weighted(ctx, H_mid, w.ffn_norm, cfg.rms_norm_eps);
+        struct ggml_tensor * gate_proj = ggml_mul_mat(ctx, const_cast<struct ggml_tensor *>(w.w_gate), ffn_in);
+        struct ggml_tensor * up_proj   = ggml_mul_mat(ctx, const_cast<struct ggml_tensor *>(w.w_up), ffn_in);
+        struct ggml_tensor * ffn_act   = opts.use_swiglu
+                                             ? ggml_swiglu_split(ctx, gate_proj, up_proj)
+                                             : ggml_mul(ctx, ggml_silu(ctx, gate_proj), up_proj);
+        struct ggml_tensor * ffn_out   = ggml_mul_mat(ctx, const_cast<struct ggml_tensor *>(w.w_down), ffn_act);
+
+        // 9. Residual 2 (expand per layer to keep topological ordering strict across KV writes)
+        H_cur = ggml_add(ctx, H_mid, ffn_out);
+        ggml_build_forward_expand(io.graph, H_cur);
+    }
+
+    if (opts.apply_final_norm && output_norm) {
+        H_cur = rms_norm_weighted(ctx, H_cur, output_norm, cfg.rms_norm_eps);
+    }
+
+    io.H_out = H_cur;
+    ggml_set_name(io.H_out, "H_out");
+    ggml_set_output(io.H_out);
     ggml_build_forward_expand(io.graph, io.H_out);
     return io;
 }

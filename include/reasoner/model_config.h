@@ -10,8 +10,8 @@ namespace opengp {
 namespace reasoner {
 
 enum class DevicePreference {
-    AUTO, // Prefer CUDA GPU if present at runtime, fall back to multi-threaded CPU
-    GPU,  // Require CUDA GPU
+    AUTO, // Prefer GPU (CUDA -> Metal -> Vulkan) if present at runtime, fall back to multi-threaded CPU
+    GPU,  // Require a GPU backend (CUDA, Metal, or Vulkan)
     CPU   // Force multi-threaded CPU execution
 };
 
@@ -44,7 +44,7 @@ struct LayerRange {
 // Runtime-configurable options for the Reasoning Engine (zero hardcoded model limits)
 struct ReasoningOptions {
     DevicePreference device           = DevicePreference::AUTO;
-    int              gpu_device_id    = 0;
+    int              gpu_device_id    = -1;    // -1 = auto (CUDA: 0; Vulkan: first dGPU else first iGPU)
     int              n_threads        = 0;     // 0 = auto-detect hardware concurrency
     KVPrecision      kv_precision     = KVPrecision::F16;
     size_t           ctx_size         = 512;   // Fixed upfront context size (halved at init if memory insufficient)
