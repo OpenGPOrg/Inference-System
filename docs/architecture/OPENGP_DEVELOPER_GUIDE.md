@@ -314,7 +314,19 @@ GPU VRAM (RTX 3060 — 5,806 MiB)                        Host RAM (Zero-Copy mma
 - **CMake (`CMakeLists.txt` & `vendor/ggml/CMakeLists.txt`):**
   - Automatically detects `CUDAToolkit` (`OPENGP_HAS_CUDA=1`), macOS Metal frameworks (`OPENGP_HAS_METAL=1` with embedded `.metal` shaders), and Vulkan (`OPENGP_HAS_VULKAN=1`, skipped in `AUTO` when CUDA or macOS is active; requires Vulkan SDK/headers + `vulkan/vulkan.hpp` + `glslc`), or builds CPU-only with native SIMD (`-march=native`) otherwise. Missing Vulkan dependencies soft-fail cleanly without aborting configuration.
   - CMake cache options: `-DOPENGP_CUDA=ON|OFF`, `-DOPENGP_METAL=ON|OFF`, `-DOPENGP_VULKAN=AUTO|ON|OFF`.
-  - Optional Vulkan build packages (Linux): Arch (`vulkan-headers vulkan-icd-loader shaderc` + Mesa ICD such as `vulkan-intel` / `vulkan-radeon`), Ubuntu/Debian (`libvulkan-dev glslc` + `mesa-vulkan-drivers`). `spirv.hpp` is vendored in-tree.
+  - **Prerequisites for AMD & Intel GPUs (Cross-Platform Driver & Build Setup):**
+    - **Ubuntu / Debian:**
+      - *Runtime only:* `sudo apt install -y libvulkan1 mesa-vulkan-drivers`
+      - *Building from source:* `sudo apt install -y libvulkan-dev glslc`
+    - **Arch Linux / Manjaro:**
+      - *Runtime only:* `sudo pacman -S vulkan-icd-loader vulkan-intel` (Intel) or `vulkan-radeon` (AMD)
+      - *Building from source:* `sudo pacman -S vulkan-headers shaderc`
+    - **Fedora / RHEL:**
+      - *Runtime only:* `sudo dnf install -y vulkan-loader mesa-vulkan-drivers`
+      - *Building from source:* `sudo dnf install -y vulkan-headers glslc`
+    - **Windows:**
+      - Standard Intel Arc/UHD Graphics drivers or AMD Adrenalin drivers provide `vulkan-1.dll` in system paths automatically.
+    - **Diagnosis:** Run `vulkaninfo --summary` to verify that ICD drivers are active and enumerating devices.
   - Compiles static core libraries `opengp_perception_core`, `opengp_reasoner_core`, `opengp_responder_core` and 3 executables: `opengp_perception`, `opengp_reasoner`, `opengp_infer`.
 - **Incremental `Makefile` (`Makefile`):**
   - `make` — Configures (if needed) and builds all targets in Release mode using all CPU cores.

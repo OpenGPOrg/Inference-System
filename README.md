@@ -19,6 +19,14 @@ OpenGP requires only CMake ($\ge$ 3.18) and a C++17 compiler. Hardware backends 
 - **Vulkan (`ggml-vulkan`):** auto-enabled on Linux/Windows (AMD, Intel Arc, and Intel UHD/Iris iGPUs) when CUDA is absent and the Vulkan SDK/headers (`vulkan/vulkan.hpp`) + `glslc` are installed. Missing Vulkan tools never fail the build—CMake logs a status line and builds CPU-only. Use `-DOPENGP_VULKAN=OFF` to disable, or `-DOPENGP_VULKAN=ON` to build alongside CUDA.
 - **CPU Fallback:** always compiled with native SIMD optimizations (`-march=native`).
 
+#### Prerequisites for Non-NVIDIA GPUs (Intel Arc / UHD / Iris & AMD Radeon):
+To run or build on machines with Intel or AMD graphics:
+- **Ubuntu / Debian:** `sudo apt install -y libvulkan1 mesa-vulkan-drivers` (for building from source, also add `libvulkan-dev glslc`)
+- **Arch / Manjaro:** `sudo pacman -S vulkan-icd-loader vulkan-intel` (or `vulkan-radeon` for AMD; add `shaderc` to build)
+- **Fedora:** `sudo dnf install -y vulkan-loader mesa-vulkan-drivers` (add `vulkan-headers glslc` to build)
+- **Windows:** Installed automatically with official Intel or AMD driver packages (`vulkan-1.dll`).
+- **Quick verify:** Run `vulkaninfo --summary` to confirm your GPU is recognized.
+
 ```bash
 git clone https://github.com/OpenGPOrg/Inference-System.git opengp
 cd opengp
