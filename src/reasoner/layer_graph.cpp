@@ -102,15 +102,22 @@ struct ggml_tensor * build_attention_block(struct ggml_context *      ctx,
 
     // 6. Scaled Dot-Product Causal Attention (unified MHA / GQA / MQA)
     struct ggml_tensor * Q_perm = ggml_permute(ctx, Q, 0, 2, 1, 3);
-    struct ggml_tensor * K_all  = ggml_permute(
-        ctx, kv.read_view_k(ctx, layer_idx, n_total), 0, 2, 1, 3);
+    struct ggml_tensor * K_raw  = kv.read_view_k(ctx, layer_idx, n_total);
+    if (ggml_is_quantized(K_raw->type)) {
+        K_raw = ggml_cast(ctx, K_raw, GGML_TYPE_F32);
+    }
+    struct ggml_tensor * K_all = ggml_permute(ctx, K_raw, 0, 2, 1, 3);
 
     struct ggml_tensor * KQ      = ggml_mul_mat(ctx, K_all, Q_perm);
     const float          scale   = 1.0f / std::sqrt(static_cast<float>(cfg.d_head_k));
     struct ggml_tensor * KQ_soft = ggml_soft_max_ext(ctx, KQ, kq_mask, scale, 0.0f);
 
+    struct ggml_tensor * V_raw = kv.read_view_v(ctx, layer_idx, n_total);
+    if (ggml_is_quantized(V_raw->type)) {
+        V_raw = ggml_cast(ctx, V_raw, GGML_TYPE_F32);
+    }
     struct ggml_tensor * V_all = ggml_cont(
-        ctx, ggml_permute(ctx, kv.read_view_v(ctx, layer_idx, n_total), 1, 2, 0, 3));
+        ctx, ggml_permute(ctx, V_raw, 1, 2, 0, 3));
     struct ggml_tensor * KQV        = ggml_mul_mat(ctx, V_all, KQ_soft);
     struct ggml_tensor * KQV_merged = ggml_cont_2d(
         ctx,
@@ -371,12 +378,19 @@ LayerGraphIO build_fused_layers_graph(struct ggml_context *                     
             KQV_merged = ggml_reshape_2d(
                 ctx, KQV, static_cast<int64_t>(cfg.d_head_v) * cfg.n_heads, n_tokens);
         } else {
-            struct ggml_tensor * K_all = ggml_permute(
-                ctx, kv.read_view_k(ctx, layer_idx, n_total), 0, 2, 1, 3); // [d_head_k, n_total, n_kv_heads]
+            struct ggml_tensor * K_raw = kv.read_view_k(ctx, layer_idx, n_total);
+            if (ggml_is_quantized(K_raw->type)) {
+                K_raw = ggml_cast(ctx, K_raw, GGML_TYPE_F32);
+            }
+            struct ggml_tensor * K_all = ggml_permute(ctx, K_raw, 0, 2, 1, 3); // [d_head_k, n_total, n_kv_heads]
             struct ggml_tensor * KQ      = ggml_mul_mat(ctx, K_all, Q_perm);
             struct ggml_tensor * KQ_soft = ggml_soft_max_ext(ctx, KQ, io.kq_mask, scale, 0.0f);
-            struct ggml_tensor * V_all   = ggml_cont(
-                ctx, ggml_permute(ctx, kv.read_view_v(ctx, layer_idx, n_total), 1, 2, 0, 3));
+            struct ggml_tensor * V_raw = kv.read_view_v(ctx, layer_idx, n_total);
+            if (ggml_is_quantized(V_raw->type)) {
+                V_raw = ggml_cast(ctx, V_raw, GGML_TYPE_F32);
+            }
+            struct ggml_tensor * V_all = ggml_cont(
+                ctx, ggml_permute(ctx, V_raw, 1, 2, 0, 3));
             struct ggml_tensor * KQV = ggml_mul_mat(ctx, V_all, KQ_soft);
             KQV_merged = ggml_cont_2d(
                 ctx,

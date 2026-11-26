@@ -46,7 +46,19 @@ bool KVCache::init(const ModelConfig &            config,
         }
     }
     backend_ = backend;
-    dtype_   = (precision == KVPrecision::F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    switch (precision) {
+        case KVPrecision::F32:  dtype_ = GGML_TYPE_F32;  break;
+        case KVPrecision::Q8_0: dtype_ = GGML_TYPE_Q8_0; break;
+        case KVPrecision::Q4_0: dtype_ = GGML_TYPE_Q4_0; break;
+        case KVPrecision::F16:
+        default:                dtype_ = GGML_TYPE_F16;  break;
+    }
+    if (ggml_is_quantized(dtype_) && ((config_.d_head_k % 32 != 0) || (config_.d_head_v % 32 != 0))) {
+        std::fprintf(stderr,
+                     "[!] KVCache: d_head (%d/%d) is not divisible by block size 32 for %s — falling back to f16\n",
+                     config_.d_head_k, config_.d_head_v, ggml_type_name(dtype_));
+        dtype_ = GGML_TYPE_F16;
+    }
     return true;
 }
 
@@ -144,12 +156,11 @@ struct ggml_tensor * KVCache::read_view_k(struct ggml_context * ctx,
                                           int                   local_layer_idx,
                                           size_t                n_total) const {
     struct ggml_tensor * base = k_layers_[local_layer_idx];
-    const size_t elem_size    = ggml_type_size(dtype_);
     return ggml_view_3d(ctx, base,
                         config_.d_head_k,
                         config_.n_kv_heads,
                         static_cast<int64_t>(n_total),
-                        static_cast<size_t>(config_.d_head_k) * elem_size,
+                        ggml_row_size(dtype_, config_.d_head_k),
                         base->nb[1],
                         0);
 }
@@ -158,12 +169,11 @@ struct ggml_tensor * KVCache::read_view_v(struct ggml_context * ctx,
                                           int                   local_layer_idx,
                                           size_t                n_total) const {
     struct ggml_tensor * base = v_layers_[local_layer_idx];
-    const size_t elem_size    = ggml_type_size(dtype_);
     return ggml_view_3d(ctx, base,
                         config_.d_head_v,
                         config_.n_kv_heads,
                         static_cast<int64_t>(n_total),
-                        static_cast<size_t>(config_.d_head_v) * elem_size,
+                        ggml_row_size(dtype_, config_.d_head_v),
                         base->nb[1],
                         0);
 }

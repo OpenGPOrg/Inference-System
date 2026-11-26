@@ -32,7 +32,7 @@ void print_usage(const char * prog) {
               << "  --device auto|gpu|cpu    Execution device preference (default: auto)\n"
               << "  --gpu-id <id>            GPU device index (default: auto; CUDA or Vulkan)\n"
               << "  --threads <N>            CPU worker threads (default: 0 = auto)\n"
-              << "  --kv-precision f16|f32   KV cache element precision (default: f16)\n"
+              << "  --kv-precision <type>    KV cache precision: f16|f32|q8_0|q4_0 (default: f16)\n"
               << "  --ctx-size <N>           Fixed context window size (default: 512; halved on init if VRAM low)\n"
               << "  --vram-util <0.1-0.95>   Max fraction of free VRAM to use (default: 0.80)\n"
               << "  --rope-type auto|norm|neox  Override RoPE layout (default: auto)\n"
@@ -143,8 +143,10 @@ int main(int argc, char ** argv) {
             else { std::fprintf(stderr, "Unknown --device '%s'\n", d.c_str()); return 1; }
         } else if (arg == "--kv-precision") {
             std::string p = need_val("--kv-precision");
-            if      (p == "f16") opts.kv_precision = KVPrecision::F16;
-            else if (p == "f32") opts.kv_precision = KVPrecision::F32;
+            if      (p == "f16")  opts.kv_precision = KVPrecision::F16;
+            else if (p == "f32")  opts.kv_precision = KVPrecision::F32;
+            else if (p == "q8_0") opts.kv_precision = KVPrecision::Q8_0;
+            else if (p == "q4_0") opts.kv_precision = KVPrecision::Q4_0;
             else { std::fprintf(stderr, "Unknown --kv-precision '%s'\n", p.c_str()); return 1; }
         } else if (arg == "--rope-type") {
             std::string r = need_val("--rope-type");

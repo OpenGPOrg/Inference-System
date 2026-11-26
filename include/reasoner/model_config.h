@@ -17,7 +17,9 @@ enum class DevicePreference {
 
 enum class KVPrecision {
     F16,
-    F32
+    F32,
+    Q8_0,
+    Q4_0
 };
 
 enum class RopeTypeOverride {
