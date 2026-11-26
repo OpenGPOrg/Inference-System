@@ -138,7 +138,8 @@ bool LmHead::init(const std::string & gguf_filepath,
         using reasoner::GpuBackendKind;
         using reasoner::GpuBackendSelection;
 
-        GpuBackendSelection sel = reasoner::select_gpu_backend(gpu_device_id);
+        const bool allow_slow_igpu = (device_pref == LmHeadDevice::GPU);
+        GpuBackendSelection sel = reasoner::select_gpu_backend(gpu_device_id, n_threads, allow_slow_igpu);
         if (sel.backend) {
             bool fits_budget = (device_pref == LmHeadDevice::GPU);
             if (device_pref == LmHeadDevice::AUTO) {
