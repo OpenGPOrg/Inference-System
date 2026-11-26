@@ -625,6 +625,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     switch (K->ne[0]) {
         case  40:
+        case  48:
         case  64:
         case  72:
         case  80:
@@ -689,6 +690,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // Head size 48 uses tile FlashAttention directly (no MMA instance compiled).
+    if (Q->ne[0] == 48) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {

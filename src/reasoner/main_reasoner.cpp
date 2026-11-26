@@ -197,7 +197,14 @@ int main(int argc, char ** argv) {
     std::cout << "[Node Slice]    Layers  : [" << lr.start << " .. " << lr.end << ") ("
               << lr.count() << " / " << engine.get_config().n_layers << " layers, final_norm="
               << (lr.should_apply_final_norm(engine.get_config().n_layers) ? "ON" : "OFF") << ")\n";
-    std::cout << "[Backend] Active Device : " << engine.get_backend_name() << "\n";
+    std::cout << "[Backend] Active Device : " << engine.get_backend_name();
+    if (engine.is_fused_graph_active()) {
+        std::cout << " [fused";
+        if (engine.is_flash_attn_active()) std::cout << "+FA";
+        if (engine.is_swiglu_fused_active()) std::cout << "+SwiGLU";
+        std::cout << "]";
+    }
+    std::cout << "\n";
     if (engine.is_gpu_active()) {
         std::cout << "[Weights] Placement     : " << ws.get_n_resident_layers() << " GPU-resident, "
                   << ws.get_n_streamed_layers() << " mmap-streamed (Total weights: "

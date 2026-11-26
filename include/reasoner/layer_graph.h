@@ -42,7 +42,7 @@ FinalNormGraphIO build_final_norm_graph(struct ggml_context *      ctx,
                                         const struct ggml_tensor * output_norm,
                                         int                        n_tokens);
 
-// Options for multi-layer fused graph construction (used exclusively by Vulkan backend)
+// Options for multi-layer fused graph construction (used by GPU backends: CUDA, Vulkan, Metal)
 struct FusedGraphOptions {
     bool use_flash_attn   = false; // Use ggml_flash_attn_ext (eliminates V transpose + KQ buffer)
     bool use_swiglu       = false; // Use fused ggml_swiglu_split instead of silu + mul

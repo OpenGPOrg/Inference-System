@@ -9,6 +9,10 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ASSERT(V->ne[0] == K->ne[0]);
             ggml_cuda_flash_attn_ext_tile_case< 40,  40>(ctx, dst);
         } break;
+        case  48: {
+            GGML_ASSERT(V->ne[0] == K->ne[0]);
+            ggml_cuda_flash_attn_ext_tile_case< 48,  48>(ctx, dst);
+        } break;
         case  64: {
             GGML_ASSERT(V->ne[0] == K->ne[0]);
             ggml_cuda_flash_attn_ext_tile_case< 64,  64>(ctx, dst);
