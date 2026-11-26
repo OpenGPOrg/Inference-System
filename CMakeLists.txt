@@ -40,6 +40,7 @@ target_link_libraries(opengp_perception PRIVATE opengp_perception_core)
 # 4. Modular Reasoner Engine Core Library (Phase 2)
 # -----------------------------------------------------------------------------
 add_library(opengp_reasoner_core STATIC
+    src/reasoner/backend_selector.cpp
     src/reasoner/model_config.cpp
     src/reasoner/weight_store.cpp
     src/reasoner/kv_cache.cpp
